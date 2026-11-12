@@ -33,7 +33,7 @@
 ```bash
 git clone https://github.com/pifu-zh/agent-courier.git ~/.local/share/agent-courier
 cd ~/.local/share/agent-courier
-npm install --omit=dev
+npm ci --omit=dev
 ```
 
 创建 `.env`（权限必须是 600，不要把 secret 提交到任何地方）：
