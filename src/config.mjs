@@ -86,12 +86,6 @@ export function loadConfig({
       raw.allowedDmUsers.every((id) => typeof id === 'string' && id),
     'allowedDmUsers must be a non-empty array of strings',
   );
-  assert(
-    Array.isArray(raw.allowedChats) &&
-      raw.allowedChats.length > 0 &&
-      raw.allowedChats.every((id) => typeof id === 'string' && id),
-    'allowedChats must be a non-empty array of strings',
-  );
   assert(SANDBOXES.has(raw.sandbox), `sandbox must be one of ${[...SANDBOXES].join(', ')}`);
   assert(REPLY_MODES.has(raw.replyMode), `replyMode must be one of ${[...REPLY_MODES].join(', ')}`);
   assert(
@@ -119,39 +113,15 @@ export function loadConfig({
     'defaultCwd must be inside allowedCwdRoots',
   );
   assert(
-    raw.requireMention === undefined || typeof raw.requireMention === 'boolean',
-    'requireMention must be a boolean',
-  );
-  assert(
     raw.model === null ||
       raw.model === undefined ||
       (typeof raw.model === 'string' && raw.model.trim()),
     'model must be null or a non-empty string',
   );
   assert(
-    Number.isInteger(raw.maxConcurrentRuns) &&
-      raw.maxConcurrentRuns >= 1 &&
-      raw.maxConcurrentRuns <= 10,
-    'maxConcurrentRuns must be an integer from 1 to 10',
-  );
-  assert(
-    Number.isInteger(raw.runTimeoutMs) &&
-      raw.runTimeoutMs >= 1000 &&
-      raw.runTimeoutMs <= 2_147_483_647,
-    'runTimeoutMs must be an integer from 1000 to 2147483647',
-  );
-  assert(
-    Number.isInteger(raw.stopGraceMs) &&
-      raw.stopGraceMs >= 0 &&
-      raw.stopGraceMs <= 2_147_483_647,
-    'stopGraceMs must be an integer from 0 to 2147483647',
-  );
-  assert(
-    raw.queueTtlMs === undefined ||
-      (Number.isInteger(raw.queueTtlMs) &&
-        raw.queueTtlMs >= 0 &&
-        raw.queueTtlMs <= 2_147_483_647),
-    'queueTtlMs must be a non-negative integer',
+    raw.developerInstructions === undefined ||
+      typeof raw.developerInstructions === 'string',
+    'developerInstructions must be a string',
   );
   assert(
     typeof raw.codexBin === 'string' && raw.codexBin.trim(),
@@ -167,24 +137,6 @@ export function loadConfig({
     (statSync(codexBin).mode & 0o111) !== 0,
     `codexBin is not executable: ${raw.codexBin}`,
   );
-  const isolation = raw.codexIsolation || { enabled: false, hidePaths: [] };
-  assert(
-    typeof isolation.enabled === 'boolean',
-    'codexIsolation.enabled must be a boolean',
-  );
-  assert(
-    Array.isArray(isolation.hidePaths) &&
-      isolation.hidePaths.every((p) => typeof p === 'string' && p.trim()),
-    'codexIsolation.hidePaths must be an array of paths',
-  );
-  const hidePaths = isolation.hidePaths.map((p) => resolveFrom(rootDir, p));
-  if (isolation.enabled) {
-    const bwrap = process.env.BWRAP_BIN || '/usr/bin/bwrap';
-    assert(
-      existsSync(bwrap),
-      `codexIsolation requires bubblewrap (${bwrap}); install it or set BWRAP_BIN`,
-    );
-  }
 
   const seedSessions = {};
   for (const [scope, entry] of Object.entries(raw.seedSessions || {})) {
@@ -199,21 +151,12 @@ export function loadConfig({
     appId: env.LARK_APP_ID,
     appSecret: env.LARK_APP_SECRET,
     allowedDmUsers: raw.allowedDmUsers,
-    allowedChats: raw.allowedChats,
-    requireMention: raw.requireMention !== false,
     defaultCwd,
     allowedCwdRoots,
     sandbox: raw.sandbox,
     model: raw.model || undefined,
-    maxConcurrentRuns: raw.maxConcurrentRuns,
-    runTimeoutMs: raw.runTimeoutMs,
-    stopGraceMs: raw.stopGraceMs,
-    queueTtlMs: raw.queueTtlMs === undefined ? 10 * 60 * 1000 : raw.queueTtlMs,
+    developerInstructions: raw.developerInstructions,
     codexBin,
-    codexIsolation: {
-      enabled: isolation.enabled,
-      hidePaths,
-    },
     replyMode: raw.replyMode,
     seedSessions,
     sessionsFile: join(rootDir, 'sessions.json'),

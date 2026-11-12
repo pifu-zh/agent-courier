@@ -2,31 +2,13 @@
   "allowedDmUsers": [
     "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   ],
-  "allowedChats": [
-    "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  ],
-  "requireMention": true,
   "defaultCwd": "workspace",
   "allowedCwdRoots": [
     "workspace"
   ],
-  "sandbox": "workspace-write",
+  "sandbox": "danger-full-access",
   "model": null,
-  "maxConcurrentRuns": 2,
-  "runTimeoutMs": 1800000,
-  "stopGraceMs": 5000,
   "codexBin": "codex",
   "replyMode": "stream",
-  "codexIsolation": {
-    "enabled": false,
-    "hidePaths": [
-      "~/.ssh",
-      "~/.gnupg",
-      "~/.aws",
-      "~/.netrc",
-      "~/.npmrc",
-      "~/.git-credentials"
-    ]
-  },
   "seedSessions": {}
 }

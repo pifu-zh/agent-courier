@@ -10,7 +10,7 @@ import {
   botLog,
   delay,
 } from '../helpers/harness.mjs';
-import { textMessage } from '../helpers/messages.mjs';
+import { dmMessage } from '../helpers/messages.mjs';
 import { STREAM_MAX, DELIVERY_CHUNK } from '../../src/format.mjs';
 
 async function start(fixture) {
@@ -23,7 +23,7 @@ test('falls back to a normal reply when card creation fails', async () => {
   const fixture = createFixture({
     name: 'stream-fail',
     env: { FAKE_STREAM_FAIL: '1' },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
+    scenario: [{ delayMs: 100, event: 'message', msg: dmMessage() }],
   });
   let handle;
   try {
@@ -44,7 +44,7 @@ test('falls back when a card content update fails', async () => {
   const fixture = createFixture({
     name: 'stream-content-fail',
     env: { FAKE_STREAM_CONTENT_FAIL: '1' },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
+    scenario: [{ delayMs: 100, event: 'message', msg: dmMessage() }],
   });
   let handle;
   try {
@@ -64,7 +64,7 @@ test('caps the streamed card and sends the remainder in paced chunks', async () 
   const fixture = createFixture({
     name: 'stream-overflow',
     env: { MOCK_CODEX_ANSWER_BYTES: '40000' },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
+    scenario: [{ delayMs: 100, event: 'message', msg: dmMessage() }],
   });
   let handle;
   try {
@@ -93,44 +93,3 @@ test('caps the streamed card and sends the remainder in paced chunks', async () 
   }
 });
 
-test('starts codex without waiting for the reaction API', async () => {
-  const fixture = createFixture({
-    name: 'reaction-delay',
-    env: { FAKE_REACTION_DELAY_MS: '700' },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
-  });
-  let handle;
-  try {
-    handle = await start(fixture);
-    await waitForBotEvent(fixture, (entry) => entry.event === 'run.end');
-    const channel = readJsonl(fixture.channelLog);
-    const scenario = channel.find((entry) => entry.type === 'scenario');
-    const startEvent = readJsonl(fixture.codexLog).find((entry) => entry.type === 'start');
-    assert.ok(scenario && startEvent);
-    const latency = startEvent.ts - scenario.ts;
-    assert.ok(latency < 450, `codex start delayed by reaction: ${latency}ms`);
-  } finally {
-    cleanupFixture(fixture, handle);
-  }
-});
-
-test('a reaction failure does not block the run', async () => {
-  const fixture = createFixture({
-    name: 'reaction-fail',
-    env: { FAKE_REACTION_FAIL: '1' },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
-  });
-  let handle;
-  try {
-    handle = await start(fixture);
-    const end = await waitForBotEvent(fixture, (entry) => entry.event === 'run.end');
-    assert.equal(end.ok, true);
-    await delay(50);
-    assert.equal(
-      readJsonl(fixture.channelLog).some((entry) => entry.type === 'reaction.remove'),
-      false,
-    );
-  } finally {
-    cleanupFixture(fixture, handle);
-  }
-});

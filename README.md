@@ -1,32 +1,33 @@
 # agent-courier
 
-用飞书**官方** [`@larksuite/channel`](https://www.npmjs.com/package/@larksuite/channel) SDK 把飞书消息接到本机 Codex CLI 的最小实现。
+用飞书**官方** [`@larksuite/channel`](https://www.npmjs.com/package/@larksuite/channel) SDK 把飞书私聊接到本机 Codex 的常驻会话。
 
 ```text
-飞书消息（WebSocket 长连接）
-  → 官方 Channel SDK（策略 / 去重 / 规范化）
-  → 本机 codex exec --json
-  → 流式 markdown 回复
+飞书私聊
+  ⇄ 官方 Channel SDK（WebSocket 长连接）
+  ⇄ 一个常驻 codex app-server
+  ⇄ 一个长期存在的 Codex thread
 ```
 
-## 特性
+插件只做消息桥接：**不会为每条消息启动新的 `codex exec` 进程**。
 
-| 能力 | 实现 |
-|---|---|
-| 接入方式 | 飞书官方 Channel SDK，WebSocket 长连接 |
-| 回复 | CardKit 流式卡片；失败时自动回退普通 markdown |
-| 会话 | 每个 chat/thread 独立保存 `threadId + cwd`，支持 `/new`、`/cd` |
-| 并发 | 单 scope 串行，全局默认 2 个 Codex 进程，其余排队 |
-| 内存 | 只保留当前答案与最近进度；工具输出 4 KB、进度 20 KB、最终答案 100 KB |
-| 安全 | allowlist、`workspace-write` sandbox、可选 bubblewrap 隐藏凭据路径 |
+## 工作方式
+
+- bot 启动时拉起一个 `codex app-server --listen stdio://`
+- 整个 bot 只有一个 Codex thread
+- 第一条消息创建 thread；后续消息通过 `turn/start` 继续
+- 当前 turn 还在执行时，新消息用 `turn/steer` 注入同一个 turn
+- 没有消息队列、没有按 chat 的并发控制
+- 不设总超时；长任务由 Codex 放进后台 tmux，不阻塞会话
+- `/stop` 中断当前 turn，`/new` 开新 thread
+- thread id 持久化到 `sessions.json`，插件重启后通过 `thread/resume` 继续
 
 ## 要求
 
 - Linux，Node.js >= 20
-- 已安装 Codex CLI，`codex exec --json` 可用
-- 可选：`bubblewrap`（`codexIsolation.enabled=true` 时需要）
+- Codex CLI 支持 `codex app-server`（当前验证版本 0.167.x）
 - 飞书自建应用已开启**长连接**事件订阅，订阅 `im.message.receive_v1`
-- 应用具备机器人能力、发送消息、添加表情回应、CardKit（流式卡片）权限
+- 应用具备机器人能力、发送消息、CardKit（流式卡片）权限
 
 ## 安装
 
@@ -50,20 +51,15 @@ chmod 600 .env
 cp config.example.json config.json
 ```
 
-`config.json` 已被 `.gitignore` 忽略。最小配置示例：
+`config.json` 已被 `.gitignore` 忽略。示例：
 
 ```json
 {
   "allowedDmUsers": ["ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
-  "allowedChats": ["oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
-  "requireMention": true,
   "defaultCwd": "workspace",
   "allowedCwdRoots": ["workspace"],
-  "sandbox": "workspace-write",
+  "sandbox": "danger-full-access",
   "model": null,
-  "maxConcurrentRuns": 2,
-  "runTimeoutMs": 1800000,
-  "stopGraceMs": 5000,
   "codexBin": "codex",
   "replyMode": "stream",
   "seedSessions": {}
@@ -74,34 +70,17 @@ cp config.example.json config.json
 
 | 字段 | 说明 |
 |---|---|
-| `allowedDmUsers` | 允许使用机器人的用户 open_id；DM 和群聊都会校验 |
-| `allowedChats` | 允许的群 chat_id；DM 不受此限制 |
-| `requireMention` | 群聊是否必须 @bot |
+| `allowedDmUsers` | 允许使用机器人的用户 open_id；**只处理私聊** |
 | `defaultCwd` | 默认工作目录；相对路径按项目根目录解析 |
-| `allowedCwdRoots` | `/cd` 允许切换到的根目录；相对路径按项目根目录解析 |
+| `allowedCwdRoots` | `/cd` 允许切换到的根目录 |
 | `sandbox` | `read-only` / `workspace-write` / `danger-full-access` |
-| `model` | 传给 `codex --model`；`null` 表示默认模型 |
-| `maxConcurrentRuns` | 全局同时运行的 Codex 进程数，1–10 |
-| `runTimeoutMs` | 单次任务超时，默认 30 分钟 |
-| `stopGraceMs` | SIGTERM 后等待多久再 SIGKILL |
-| `queueTtlMs` | 排队任务过期时间，默认 10 分钟 |
-| `codexBin` | Codex 可执行文件；可写绝对路径、相对路径或 PATH 中的命令名 |
+| `model` | 传给 Codex 的模型；`null` 表示默认模型 |
+| `codexBin` | Codex 可执行文件；绝对路径、相对路径或 PATH 中的命令名 |
 | `replyMode` | `stream`（流式卡片）或 `final`（只发最终结果） |
-| `codexIsolation` | `enabled` 为 true 时用 bubblewrap 启动 Codex；`hidePaths` 支持 `~/...` |
-| `seedSessions` | 首次启动时写入的 scope → thread/cwd |
+| `developerInstructions` | 可选，覆盖默认的开发者指令（默认要求长任务放 tmux） |
+| `seedSessions` | 可选，首次启动时导入的旧 thread/cwd |
 
-`seedSessions` 示例（只想延续已有会话时使用）：
-
-```json
-{
-  "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": {
-    "threadId": "00000000-0000-0000-0000-000000000000",
-    "cwd": "workspace"
-  }
-}
-```
-
-> `sessions.json` 只在**不存在**时用 `seedSessions` 初始化；之后由运行过程维护。不要在 bot 运行时手工改 `sessions.json`。
+> 只支持 owner 私聊。群聊消息会被忽略，不会回复。
 
 ## 运行
 
@@ -112,7 +91,7 @@ cd ~/.local/share/agent-courier
 npm start
 ```
 
-systemd user service（假设安装在 `~/.local/share/agent-courier`）：
+systemd user service：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -125,23 +104,17 @@ journalctl --user -u agent-courier.service -f
 
 如果安装目录不同，修改 unit 里的 `WorkingDirectory`、`EnvironmentFile` 和 `ExecStart`。`PATH` 需要包含 `codex` 所在目录。
 
-停止：
-
-```bash
-systemctl --user disable --now agent-courier.service
-```
-
 ## 飞书命令
 
 | 命令 | 作用 |
 |---|---|
 | `/help` | 显示帮助 |
-| `/new`、`/reset` | 中断当前任务、清空该会话排队消息并开始新 thread |
-| `/stop` | 中断当前任务并清空该会话排队消息 |
-| `/status` | 显示 thread、cwd、sandbox、队列 |
+| `/new`、`/reset` | 中断当前 turn，开始新 thread |
+| `/stop` | 中断当前 turn |
+| `/status` | 显示 thread、cwd、app-server、当前 turn |
 | `/cd <路径>` | 切换 cwd 并开始新 thread；支持 `~` |
 
-普通消息直接进入 Codex。同一 scope 同时只跑一个任务；后面的消息排队（每 scope 最多 20 条）。
+普通消息直接进入当前对话；turn 运行中会以 `turn/steer` 注入。
 
 ## 日志
 
@@ -151,54 +124,51 @@ systemctl --user disable --now agent-courier.service
 
 ## 安全边界
 
-- 默认只接受 allowlist 里的用户和群；群聊还要 @bot
-- 默认 `workspace-write`，Codex 不能随意改工作区外文件
-- `approval_policy="never"` 只在 sandbox 内生效；不要把 sandbox 改成 `danger-full-access`，除非明确需要
-- `codexIsolation.enabled=true` 时，Codex 由 `bwrap --unshare-pid --dev-bind / /` 启动；`hidePaths` 中的目录用 tmpfs 覆盖、普通文件用 `/dev/null` 覆盖，Codex 读不到 bot 的 `.env`、SSH key、npm token 等
-- 残余风险：`~/.codex/auth.json` 必须让 Codex 读到；被提示注入的任务仍可能打印它。要彻底隔离需要独立 UID 或容器
+- **只接受 `allowedDmUsers` 中用户的私聊**；群聊一律忽略
+- 默认示例使用 `danger-full-access`：Codex 可以读写当前用户的整个环境
+- 如果不需要完全权限，把 `sandbox` 改成 `workspace-write`
 - `.env` 必须 600；不要提交、不要发到聊天里
 - 单实例锁会阻止同一个目录启动两个 bot；不要同时运行两个连接同一飞书应用的服务
 
 ## 当前限制
 
 - 只处理文本消息；图片/文件附件不会转发给 Codex。
+- 整个 bot 只有一个 thread；`/new` 才会换新会话。
+- 没有总超时；卡死时用 `/stop` 人工中断。
 - 超长答案：卡片最多 26k，剩余内容分片补发，单次总计最多 101k。
-- 群聊里只有 `allowedDmUsers` 中的用户能触发，其他成员即使 @bot 也不会执行。
-- `/stop` 和 `/new` 会静默丢弃该会话已排队的消息，不会逐条通知。
-- `maxConcurrentRuns > 1` 时，SDK 的流更新失败计数是进程级的；极端情况下另一个会话的失败会让本会话回退为普通消息，可能重复一次内容。
 - 流式卡片依赖应用具备 CardKit 权限；缺失时 SDK 自动回退普通 markdown。
+- `codex app-server` 目前是 experimental；升级 Codex 后需要回归测试协议。
 
 ## 内存
 
-- 不保存事件数组；每个 run 只持有当前答案和最近 20 KB 进度
+- Codex 由一个常驻 app-server 承载，不再每条消息启动进程
+- bot 只保留当前 turn 的答案和最近进度
 - 单条工具输出截断 4 KB，最终答案截断 100 KB
-- 流式卡片最多 26k 字符；超出部分按 3k 分片、250ms 间隔补发，总计最多 101k
-- Codex stderr 只保留尾部 64 KB
-- 单 scope 串行 + 全局并发 2
-- 服务以 `--max-old-space-size=256` 启动：异常增长会先 OOM 重启，不会顶满宿主内存
-- 不设置 cgroup `MemoryMax`：Codex 子进程在同一个 cgroup，硬上限会误杀长任务
+- app-server 的 thread 和历史由 Codex 自己管理
+- 服务以 `--max-old-space-size=256` 启动：bot 进程异常增长会先 OOM 重启
+- 不设置 cgroup `MemoryMax`：Codex 子进程在同一 cgroup，硬上限会误杀长任务
 
 观察内存：
 
 ```bash
 systemctl --user show agent-courier.service -p MemoryCurrent -p MemoryPeak
 smem -P node -c "pid user command rss pss uss"
+ps -eo pid,ppid,rss,cmd | grep "codex app-server"
 ```
 
 ## 测试
 
 ```bash
-npm test                  # 单元 + 集成 + 内存（112 个用例，约 45–50s）
+npm test                  # 单元 + 集成 + 内存
 npm run test:unit
 npm run test:integration
 npm run test:memory
-RUN_REAL_CODEX=1 npm test # 额外跑真实 Codex
+RUN_REAL_CODEX=1 npm test # 额外跑真实 Codex app-server
 ```
 
-测试使用假 Feishu Channel 和假 Codex 可执行文件，不需要飞书网络；真实飞书消息仍需人工发一条。
+测试使用假 Feishu Channel 和假 app-server，不需要飞书网络；真实飞书消息仍需人工发一条。
 
 - `RUN_REAL_CODEX=1` 时可用 `CODEX_BIN` 指定 Codex 路径，默认使用 PATH 中的 `codex`。
-- 隔离测试需要 `bubblewrap`，可用 `BWRAP_BIN` 指定路径。
 
 完整测试矩阵与内存数据见 [`docs/TESTING.md`](docs/TESTING.md)；从 `lark-channel-bridge` 借鉴/拒绝的做法见 [`docs/BRIDGE-LESSONS.md`](docs/BRIDGE-LESSONS.md)。
 
@@ -211,27 +181,30 @@ RUN_REAL_CODEX=1 npm test # 额外跑真实 Codex
 systemctl --user disable --now <old-service>
 ```
 
-确认新服务正常后，再按需删除旧服务。回滚只需停掉 `agent-courier.service` 并重新启动旧服务；旧 bridge 的状态目录不会被本项目修改。
+回滚只需停掉 `agent-courier.service` 并重新启动旧服务；旧 bridge 的状态目录不会被本项目修改。
 
 ## 故障排查
 
 **启动时报 `LARK_APP_ID is missing`**
 ：`.env` 不在项目根目录，或权限/内容不对。
 
+**启动时报 `appserver.start_failed`**
+：确认 `codex app-server --listen stdio://` 能正常启动，且 `codexBin` 可执行。
+
 **`bot.connect_failed`**
 ：检查飞书开发者后台「事件订阅」是否选择长连接，应用是否启用机器人能力；确认没有第二个进程连着同一个 app。
 
 **能连上但收不到消息**
-：检查事件订阅是否包含 `im.message.receive_v1`；检查 `config.json` 的 `allowedDmUsers` / `allowedChats`；群里是否 @bot。
+：检查事件订阅是否包含 `im.message.receive_v1`；检查 `allowedDmUsers`；只支持私聊。
 
 **回复不是流式卡片**
 ：应用可能缺少 CardKit 权限，SDK 会自动回退为普通 markdown；日志里会有 `stream.failed`。
 
-**`codex exited with code ...`**
-：先用同一个 cwd 手工跑一次：
+**`app-server exited`**
+：bot 会在下一条消息时自动重启 app-server，并通过 `thread/resume` 恢复；如果连续失败，手工运行：
 
 ```bash
-codex exec --json --sandbox workspace-write -C <cwd> -
+codex app-server --listen stdio://
 ```
 
 **想完全关闭流式**

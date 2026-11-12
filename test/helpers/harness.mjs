@@ -51,8 +51,8 @@ export function createFixture({
   );
   copyFileSync(join(HERE, 'fake-channel.mjs'), join(channelDir, 'index.mjs'));
 
-  const mockCodex = join(root, 'mock-codex.mjs');
-  copyFileSync(join(HERE, 'mock-codex.mjs'), mockCodex);
+  const mockCodex = join(root, 'mock-app-server.mjs');
+  copyFileSync(join(HERE, 'mock-app-server.mjs'), mockCodex);
   chmodSync(mockCodex, 0o755);
 
   const work = join(root, 'work');
@@ -60,17 +60,11 @@ export function createFixture({
 
   const config = {
     allowedDmUsers: ['ou_test'],
-    allowedChats: ['oc_test'],
-    requireMention: true,
     defaultCwd: work,
     allowedCwdRoots: [root],
     sandbox: 'read-only',
     model: null,
-    maxConcurrentRuns: 2,
-    runTimeoutMs: 10000,
-    stopGraceMs: 500,
     codexBin: mockCodex,
-    codexIsolation: { enabled: false, hidePaths: [] },
     replyMode: 'stream',
     seedSessions: {},
     ...configOverrides,

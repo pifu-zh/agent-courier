@@ -1,45 +1,21 @@
-import { spawn } from 'node:child_process';
-import { existsSync, realpathSync, statSync } from 'node:fs';
-import { createInterface } from 'node:readline';
-import { Transform } from 'node:stream';
-import { StringDecoder } from 'node:string_decoder';
+import { createAppServer } from './app-server.mjs';
 import { logger as defaultLogger } from './log.mjs';
 
-const STDERR_TAIL_BYTES = 64 * 1024;
 const TOOL_OUTPUT_MAX = 4096;
-const POST_DONE_EXIT_GRACE_MS = 5000;
-const STDOUT_DRAIN_GRACE_MS = 250;
 const MAX_ANSWER_BUFFER = 200_000;
-const MAX_LINE_CHARS = 8 * 1024 * 1024;
-
-class LineLimiter extends Transform {
-  constructor(maxChars = MAX_LINE_CHARS) {
-    super();
-    this.maxChars = maxChars;
-    this.buffer = '';
-    this.decoder = new StringDecoder('utf8');
-  }
-
-  _transform(chunk, encoding, callback) {
-    this.buffer += this.decoder.write(chunk);
-    if (this.buffer.length > this.maxChars) {
-      callback(new Error(`codex JSONL line exceeds ${this.maxChars} characters`));
-      return;
-    }
-    let index;
-    while ((index = this.buffer.indexOf('\n')) !== -1) {
-      this.push(this.buffer.slice(0, index + 1));
-      this.buffer = this.buffer.slice(index + 1);
-    }
-    callback();
-  }
-
-  _flush(callback) {
-    this.buffer += this.decoder.end();
-    if (this.buffer) this.push(this.buffer);
-    callback();
-  }
-}
+const DEFAULT_APPSERVER_ARGS = [
+  'app-server',
+  '--listen',
+  'stdio://',
+  '-c',
+  'shell_environment_policy.inherit="all"',
+];
+const DEFAULT_DEVELOPER_INSTRUCTIONS = [
+  'You are accessed through a chat bridge.',
+  'Long-running commands (builds, tests, downloads, remote experiments) MUST be started',
+  'in a detached tmux session and the turn must return promptly with the session name',
+  'and log path. Never block the turn waiting for long-running work.',
+].join(' ');
 
 function clip(value, max) {
   if (typeof value !== 'string') return '';
@@ -47,474 +23,329 @@ function clip(value, max) {
   return `${value.slice(0, max)}\n…[truncated]`;
 }
 
-function isolationHides(hidePaths = []) {
-  const hides = [];
-  for (const path of hidePaths) {
-    if (typeof path !== 'string' || !path.startsWith('/') || !existsSync(path)) continue;
-    try {
-      const real = realpathSync.native(path);
-      hides.push({ path: real, isDirectory: statSync(real).isDirectory() });
-    } catch {
-      // the path disappeared or cannot be resolved
-    }
-  }
-  return hides;
+function mergeAnswer(current, text) {
+  if (typeof text !== 'string' || !text) return current;
+  if (!current) return text;
+  if (text === current || current.endsWith(text)) return current;
+  if (text.startsWith(current)) return text;
+  return `${current}\n\n${text}`;
 }
 
-export function buildCodexArgs({ cwd, sandbox, model, threadId }) {
-  const flags = [
-    '--sandbox',
-    sandbox,
-    ...(model ? ['--model', model] : []),
-    '-c',
-    'approval_policy="never"',
-    '-c',
-    'shell_environment_policy.inherit="all"',
-    '--ignore-rules',
-    '--skip-git-repo-check',
-    '-C',
-    cwd,
-  ];
-
-  if (threadId) {
-    return ['exec', ...flags, 'resume', '--json', threadId, '-'];
-  }
-  return ['exec', '--json', ...flags, '-'];
+function turnError(turn) {
+  if (!turn || !turn.error) return '';
+  if (typeof turn.error === 'string') return turn.error;
+  return turn.error.message || '';
 }
 
-export async function runCodex({
-  prompt,
-  cwd,
-  sandbox,
-  model,
-  threadId,
+export function createCodexRunner({
   codexBin,
-  timeoutMs,
-  stopGraceMs,
-  signal,
-  onThreadId,
-  onAnswer,
-  onTool,
   logger = defaultLogger,
-  postDoneGraceMs = POST_DONE_EXIT_GRACE_MS,
   env = {},
-  isolation = { enabled: false, hidePaths: [] },
+  appServerArgs = DEFAULT_APPSERVER_ARGS,
+  developerInstructions = DEFAULT_DEVELOPER_INSTRUCTIONS,
+  clientInfo = { name: 'agent-courier', title: 'Agent Courier', version: '0.2.0' },
 }) {
-  const args = buildCodexArgs({ cwd, sandbox, model, threadId });
-  const bwrapBin = process.env.BWRAP_BIN || '/usr/bin/bwrap';
-  const isolated = isolation.enabled === true && existsSync(bwrapBin);
-  const hides = isolated ? isolationHides(isolation.hidePaths) : [];
-  const spawnBin = isolated ? bwrapBin : codexBin;
-  const spawnArgs = isolated
-    ? [
-        '--die-with-parent',
-        '--unshare-pid',
-        '--dev-bind',
-        '/',
-        '/',
-        '--proc',
-        '/proc',
-        ...hides.flatMap((hide) =>
-          hide.isDirectory
-            ? ['--tmpfs', hide.path]
-            : ['--ro-bind', '/dev/null', hide.path],
-        ),
-        '--',
-        codexBin,
-        ...args,
-      ]
-    : args;
-  logger.info?.('codex.spawn', {
-    cwd,
-    sandbox,
-    resume: Boolean(threadId),
-    model: model || 'default',
-    isolated,
-    hiddenPaths: hides.length,
-  });
-
-  const childEnv = { ...process.env, ...env };
-  delete childEnv.LARK_APP_SECRET;
-
-  const child = spawn(spawnBin, spawnArgs, {
-    cwd,
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32',
-  });
-
-  let stderrTail = '';
-  let thread = threadId || null;
-  let answer = '';
-  let terminal = false;
-  let failed = false;
-  let lastError = '';
-  let timedOut = false;
-  let aborted = false;
-  let spawnError = null;
-  let postDoneTimer = null;
-  let postDoneKilled = false;
-  let rl = null;
-  let lineError = null;
+  let server = null;
+  let starting = null;
+  const activeByThread = new Map();
+  const loadedThreads = new Set();
   const unknownEvents = new Set();
 
-  const appendAgentMessage = (text) => {
-    if (typeof text !== 'string' || !text) return;
-    if (!answer) {
-      answer = text;
-    } else if (text === answer || answer.endsWith(text)) {
-      return;
-    } else if (text.startsWith(answer)) {
-      answer = text;
-    } else {
-      answer = `${answer}\n\n${text}`;
-    }
-    if (answer.length > MAX_ANSWER_BUFFER) {
-      answer = answer.slice(-MAX_ANSWER_BUFFER);
-    }
-    onAnswer?.(answer);
-  };
-
-  let killTimer = null;
-
-  const signalTree = (signal) => {
-    if (process.platform !== 'win32' && child.pid) {
-      try {
-        process.kill(-child.pid, signal);
-        return;
-      } catch {
-        // fall back to the direct child
-      }
-    }
-    try {
-      child.kill(signal);
-    } catch {
-      // already gone
-    }
-  };
-
-  const killGracefully = () => {
-    signalTree('SIGTERM');
-    if (killTimer) clearTimeout(killTimer);
-    killTimer = setTimeout(() => {
-      killTimer = null;
-      signalTree('SIGKILL');
-    }, stopGraceMs);
-    killTimer.unref?.();
-  };
-
-  const armPostDoneKill = () => {
-    if (postDoneTimer) return;
-    postDoneTimer = setTimeout(() => {
-      postDoneTimer = null;
-      postDoneKilled = true;
-      logger.warn?.('codex.post_done_exit_timeout', { graceMs: postDoneGraceMs });
-      killGracefully();
-    }, postDoneGraceMs);
-    postDoneTimer.unref?.();
-  };
-
-  const clearPostDoneTimer = () => {
-    if (!postDoneTimer) return;
-    clearTimeout(postDoneTimer);
-    postDoneTimer = null;
-  };
-
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    killGracefully();
-  }, timeoutMs);
-  timeout.unref?.();
-
-  const onAbort = () => {
-    aborted = true;
-    killGracefully();
-  };
-
-  if (signal) {
-    if (signal.aborted) onAbort();
-    else signal.addEventListener('abort', onAbort, { once: true });
-  }
-
-  child.on('error', (err) => {
-    spawnError = err;
-  });
-  child.once('exit', () => {
-    clearPostDoneTimer();
-    if (killTimer) {
-      clearTimeout(killTimer);
-      killTimer = null;
-    }
-    if (child.stdout && !child.stdout.readableEnded) {
-      const drainTimer = setTimeout(() => {
-        try {
-          rl?.close();
-          if (!child.stdout.readableEnded) child.stdout.destroy();
-        } catch {
-          // already closed
-        }
-      }, STDOUT_DRAIN_GRACE_MS);
-    }
-  });
-  child.once('close', clearPostDoneTimer);
-
-  if (!child.stdout || !child.stderr || !child.stdin) {
-    clearTimeout(timeout);
-    clearPostDoneTimer();
-    if (signal) signal.removeEventListener('abort', onAbort);
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode: -1,
-      error: spawnError ? `failed to spawn codex: ${spawnError.message}` : 'failed to open codex pipes',
-      timedOut,
-      aborted,
-    };
-  }
-
-  child.stderr.on('data', (chunk) => {
-    stderrTail = (stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
-  });
-
-  child.stdin.on('error', () => {
-    // Codex can close stdin early; the exit status carries the real error.
-  });
-  child.stdin.end(prompt, 'utf8');
-
-  const limiter = new LineLimiter();
-  child.stdout.pipe(limiter);
-  limiter.on('error', (err) => {
-    lineError = err;
-    logger.warn?.('codex.line_too_large', { message: err.message });
-    killGracefully();
-    try {
-      rl?.close();
-    } catch {
-      // already closed
-    }
-  });
-  rl = createInterface({ input: limiter, crlfDelay: Infinity });
-  rl.on('error', () => {
-    // the limiter's error handler owns reporting and child termination
-  });
-  try {
-    for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      let event;
-      try {
-        event = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
-      if (!event || typeof event !== 'object') continue;
-      if (terminal) continue;
-
-      switch (event.type) {
-        case 'thread.started': {
-          const id = event.thread_id ?? event.threadId;
-          if (typeof id === 'string' && id) {
-            thread = id;
-            onThreadId?.(id);
-          }
-          break;
-        }
-        case 'item.started': {
-          const item = event.item;
-          if (item && typeof item === 'object' && item.type === 'command_execution') {
-            const command = typeof item.command === 'string' ? item.command : '';
-            if (command) onTool?.({ command, phase: 'started' });
-          }
-          break;
-        }
-        case 'item.completed': {
-          const item = event.item;
-          if (!item || typeof item !== 'object') break;
-          if (item.type === 'agent_message') {
-            const text = item.text ?? item.message;
-            if (typeof text === 'string' && text) appendAgentMessage(text);
-          } else if (item.type === 'command_execution') {
-            const command = typeof item.command === 'string' ? item.command : '';
-            const rawOutput =
-              typeof item.aggregated_output === 'string'
-                ? item.aggregated_output
-                : typeof item.output === 'string'
-                  ? item.output
-                  : '';
-            onTool?.({
-              command,
-              output: clip(rawOutput, TOOL_OUTPUT_MAX),
-              exitCode: item.exit_code,
-              phase: 'completed',
-            });
-          }
-          break;
-        }
-        case 'agent_message': {
-          const text = event.message ?? event.text;
-          if (typeof text === 'string' && text) appendAgentMessage(text);
-          break;
-        }
-        case 'turn.started':
-          break;
-        case 'turn.completed':
-          terminal = true;
-          armPostDoneKill();
-          break;
-        case 'turn.failed': {
-          terminal = true;
-          failed = true;
-          const failure = event.error;
-          lastError = String(
-            failure?.message ??
-              (typeof failure === 'string' ? failure : event.message) ??
-              'codex turn failed',
-          );
-          armPostDoneKill();
-          break;
-        }
-        case 'error': {
-          const failure = event.error;
-          lastError = String(
-            event.message ??
-              (typeof failure === 'string' ? failure : failure?.message) ??
-              'codex error',
-          );
-          logger.warn?.('codex.event_error', { message: lastError.slice(0, 300) });
-          break;
-        }
-        default:
-          if (typeof event.type === 'string' && !unknownEvents.has(event.type)) {
-            unknownEvents.add(event.type);
-            logger.warn?.('codex.unknown_event', { type: event.type });
-          }
-          break;
-      }
-    }
-  } catch (err) {
-    logger.warn?.('codex.stdout_error', { message: err?.message || String(err) });
-  } finally {
-    clearTimeout(timeout);
-    if (signal) signal.removeEventListener('abort', onAbort);
-    rl.close();
-  }
-
-  if (child.exitCode === null && child.signalCode === null) {
-    armPostDoneKill();
-  }
-
-  const exitCode = await new Promise((resolve) => {
-    if (child.exitCode !== null) return resolve(child.exitCode);
-    if (child.signalCode !== null) return resolve(1);
-    if (spawnError) return resolve(-1);
-
-    const done = (code) => {
-      child.off('exit', onExit);
-      child.off('error', onError);
-      child.off('close', onClose);
-      resolve(code);
-    };
-    const onExit = (code) => done(code ?? 1);
-    const onError = () => done(-1);
-    const onClose = (code) => done(code ?? -1);
-
-    child.once('exit', onExit);
-    child.once('error', onError);
-    child.once('close', onClose);
-  });
-
-  if (spawnError) {
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode: -1,
-      error: `failed to spawn codex: ${spawnError.message}`,
-      timedOut,
-      aborted,
-    };
-  }
-  if (timedOut) {
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: `codex timed out after ${Math.round(timeoutMs / 1000)}s`,
-      timedOut,
-      aborted,
-    };
-  }
-  if (aborted) {
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: '已停止',
-      timedOut,
-      aborted,
-      cancelled: true,
-    };
-  }
-  if (failed) {
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: lastError || 'codex turn failed',
-      timedOut,
-      aborted,
-    };
-  }
-  if (lineError && !terminal) {
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: `codex output line too large: ${lineError.message}`,
-      timedOut,
-      aborted,
-    };
-  }
-  if (exitCode !== 0 && !(terminal && !failed && postDoneKilled)) {
-    const tail = stderrTail.trim().slice(-2000);
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: `codex exited with code ${exitCode}${tail ? `: ${tail}` : ''}`,
-      timedOut,
-      aborted,
-    };
-  }
-  if (!terminal) {
-    const detail = lastError ? `: ${lastError}` : '';
-    return {
-      ok: false,
-      threadId: thread,
-      answer,
-      exitCode,
-      error: `codex stream ended before a terminal event${detail}`,
-      timedOut,
-      aborted,
+  function finish(ctx, result) {
+    if (ctx.finished) return;
+    ctx.finished = true;
+    activeByThread.delete(ctx.threadId);
+    ctx.resolve({
+      ok: Boolean(result.ok),
+      threadId: ctx.threadId,
+      turnId: ctx.turnId,
+      answer: ctx.answer,
+      error: result.error || null,
+      cancelled: Boolean(result.cancelled),
       unknownEventTypes: [...unknownEvents],
+    });
+  }
+
+  function handleTerminal(ctx, turn) {
+    const status = turn?.status;
+    if (status === 'inProgress') return;
+    if (status === 'completed') {
+      finish(ctx, { ok: true });
+      return;
+    }
+    if (status === 'interrupted') {
+      finish(ctx, { ok: false, cancelled: true, error: '已停止' });
+      return;
+    }
+    finish(ctx, {
+      ok: false,
+      error: turnError(turn) || ctx.lastError || 'codex turn failed',
+    });
+  }
+
+  function handleNotification(method, params) {
+    if (method === 'exit') {
+      const error = params?.error || 'app-server exited';
+      logger.error?.('appserver.exited', { error });
+      server = null;
+      loadedThreads.clear();
+      for (const ctx of [...activeByThread.values()]) {
+        finish(ctx, { ok: false, error });
+      }
+      return;
+    }
+
+    const threadId = params?.threadId;
+    if (!threadId) return;
+    const ctx = activeByThread.get(threadId);
+    if (!ctx) return;
+
+    switch (method) {
+      case 'turn/started': {
+        if (!ctx.turnId && params.turn?.id) ctx.turnId = params.turn.id;
+        break;
+      }
+      case 'item/agentMessage/delta': {
+        if (typeof params.delta === 'string' && params.delta) {
+          ctx.answer = `${ctx.answer}${params.delta}`.slice(-MAX_ANSWER_BUFFER);
+          ctx.onAnswer?.(ctx.answer);
+        }
+        break;
+      }
+      case 'item/started': {
+        const item = params.item;
+        if (item?.type === 'commandExecution' && item.command) {
+          ctx.onTool?.({ command: item.command, phase: 'started' });
+        }
+        break;
+      }
+      case 'item/completed': {
+        const item = params.item;
+        if (!item || typeof item !== 'object') break;
+        if (item.type === 'agentMessage' && typeof item.text === 'string' && item.text) {
+          ctx.answer = mergeAnswer(ctx.answer, item.text).slice(-MAX_ANSWER_BUFFER);
+          ctx.onAnswer?.(ctx.answer);
+        } else if (item.type === 'commandExecution') {
+          ctx.onTool?.({
+            command: item.command || '',
+            output: clip(item.aggregatedOutput, TOOL_OUTPUT_MAX),
+            exitCode: item.exitCode,
+            phase: 'completed',
+          });
+        }
+        break;
+      }
+      case 'error': {
+        const message =
+          params.error?.message || params.message || 'codex turn error';
+        ctx.lastError = message;
+        logger.warn?.('appserver.turn_error', {
+          message: message.slice(0, 300),
+          willRetry: Boolean(params.willRetry),
+        });
+        break;
+      }
+      case 'turn/completed': {
+        handleTerminal(ctx, params.turn);
+        break;
+      }
+      case 'thread/started':
+      case 'thread/status/changed':
+      case 'thread/goal/cleared':
+      case 'thread/goal/updated':
+      case 'turn/plan/updated':
+      case 'turn/diff/updated':
+      case 'thread/tokenUsage/updated':
+      case 'item/reasoning/textDelta':
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/summaryPartAdded':
+      case 'item/commandExecution/outputDelta':
+      case 'item/fileChange/outputDelta':
+      case 'item/fileChange/patchUpdated':
+      case 'item/mcpToolCall/progress':
+      case 'hook/started':
+      case 'hook/completed':
+      case 'mcpServer/startupStatus/updated':
+      case 'account/rateLimits/updated':
+      case 'remoteControl/status/changed':
+      case 'configWarning':
+        break;
+      default: {
+        if (!unknownEvents.has(method)) {
+          unknownEvents.add(method);
+          logger.warn?.('appserver.unknown_event', { method });
+        }
+        break;
+      }
+    }
+  }
+
+  async function ensureServer() {
+    if (server?.alive) return server;
+    if (starting) return starting;
+    starting = (async () => {
+      const client = createAppServer({
+        command: codexBin,
+        args: appServerArgs,
+        cwd: process.cwd(),
+        env,
+        logger,
+        clientInfo,
+      });
+      client.onNotification(handleNotification);
+      try {
+        await client.start();
+        server = client;
+        return client;
+      } catch (err) {
+        await client.stop().catch(() => {});
+        throw err;
+      }
+    })().finally(() => {
+      starting = null;
+    });
+    return starting;
+  }
+
+  async function start() {
+    const client = await ensureServer();
+    return { pid: client.pid, alive: client.alive };
+  }
+
+  async function ensureThread({ threadId, cwd, sandbox, model }) {
+    const client = await ensureServer();
+    const params = {
+      cwd,
+      approvalPolicy: 'never',
+      sandbox,
+      ...(model ? { model } : {}),
+      ...(developerInstructions ? { developerInstructions } : {}),
     };
+
+    if (threadId) {
+      if (loadedThreads.has(threadId)) {
+        return { threadId, resumed: true };
+      }
+      try {
+        await client.request('thread/resume', { threadId, ...params });
+        loadedThreads.add(threadId);
+        return { threadId, resumed: true };
+      } catch (err) {
+        const error = new Error(err.message);
+        error.code = 'THREAD_RESUME_FAILED';
+        throw error;
+      }
+    }
+
+    const response = await client.request('thread/start', {
+      ...params,
+      ephemeral: false,
+    });
+    const id = response?.thread?.id;
+    if (!id) throw new Error('thread/start returned no thread id');
+    loadedThreads.add(id);
+    logger.info?.('appserver.thread', { threadId: id, cwd });
+    return { threadId: id, resumed: false };
+  }
+
+  async function startTurn({
+    threadId,
+    prompt,
+    cwd,
+    sandbox,
+    model,
+    onAnswer,
+    onTool,
+  }) {
+    if (activeByThread.has(threadId)) {
+      const error = new Error(`thread already has an active turn: ${threadId}`);
+      error.code = 'TURN_ACTIVE';
+      throw error;
+    }
+
+    const client = await ensureServer();
+    let resolveRun;
+    const done = new Promise((resolve) => {
+      resolveRun = resolve;
+    });
+    const ctx = {
+      threadId,
+      turnId: null,
+      answer: '',
+      lastError: '',
+      finished: false,
+      onAnswer,
+      onTool,
+      resolve: resolveRun,
+    };
+    activeByThread.set(threadId, ctx);
+
+    try {
+      const response = await client.request('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: prompt, text_elements: [] }],
+      });
+      if (!ctx.turnId) ctx.turnId = response?.turn?.id || null;
+    } catch (err) {
+      finish(ctx, {
+        ok: false,
+        error: `failed to start codex turn: ${err.message}`,
+      });
+    }
+
+    return { threadId, turnId: ctx.turnId, done };
+  }
+
+  async function steer({ threadId, turnId, prompt }) {
+    const client = await ensureServer();
+    return client.request('turn/steer', {
+      threadId,
+      expectedTurnId: turnId,
+      input: [{ type: 'text', text: prompt, text_elements: [] }],
+    });
+  }
+
+  async function interrupt({ threadId, turnId }) {
+    if (!threadId || !turnId) return false;
+    const client = await ensureServer();
+    try {
+      await client.request(
+        'turn/interrupt',
+        { threadId, turnId },
+        { timeoutMs: 5000 },
+      );
+      return true;
+    } catch (err) {
+      logger.warn?.('appserver.interrupt_failed', { message: err.message });
+      return false;
+    }
+  }
+
+  function activeTurn(threadId) {
+    const ctx = activeByThread.get(threadId);
+    return ctx ? { threadId: ctx.threadId, turnId: ctx.turnId } : null;
+  }
+
+  async function close() {
+    for (const ctx of [...activeByThread.values()]) {
+      finish(ctx, { ok: false, error: 'app-server is shutting down' });
+    }
+    const client = server;
+    server = null;
+    loadedThreads.clear();
+    if (client) await client.stop().catch(() => {});
   }
 
   return {
-    ok: true,
-    threadId: thread,
-    answer,
-    exitCode,
-    error: null,
-    timedOut,
-    aborted,
-    unknownEventTypes: [...unknownEvents],
+    start,
+    ensureThread,
+    startTurn,
+    steer,
+    interrupt,
+    activeTurn,
+    close,
+    get pid() {
+      return server?.pid ?? 0;
+    },
   };
 }

@@ -8,7 +8,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   loadConfig,
@@ -30,15 +30,10 @@ function setup() {
 function baseConfig(dir, codex, work) {
   return {
     allowedDmUsers: ['ou_owner'],
-    allowedChats: ['oc_group'],
-    requireMention: true,
     defaultCwd: work,
     allowedCwdRoots: [dir],
     sandbox: 'read-only',
     model: null,
-    maxConcurrentRuns: 2,
-    runTimeoutMs: 10000,
-    stopGraceMs: 500,
     codexBin: codex,
     replyMode: 'stream',
     seedSessions: {},
@@ -71,9 +66,7 @@ test('loads env and config, resolves paths and defaults', () => {
     assert.equal(loaded.defaultCwd, work);
     assert.equal(loaded.sessionsFile, join(dir, 'sessions.json'));
     assert.equal(loaded.logsDir, join(dir, 'logs'));
-    assert.equal(loaded.requireMention, true);
     assert.equal(loaded.model, undefined);
-    assert.equal(loaded.queueTtlMs, 10 * 60 * 1000);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -87,7 +80,6 @@ test('resolves relative paths, home paths and commands from PATH', () => {
     const config = baseConfig(dir, 'codex', 'workspace');
     config.allowedCwdRoots = ['workspace'];
     config.seedSessions = { oc_test: { threadId: 'thread_seed', cwd: 'workspace' } };
-    config.codexIsolation = { enabled: false, hidePaths: ['~/.ssh', 'workspace'] };
     writeConfig(dir, config);
     const loaded = loadConfig({
       envFile: join(dir, 'missing.env'),
@@ -101,10 +93,6 @@ test('resolves relative paths, home paths and commands from PATH', () => {
     assert.equal(loaded.codexBin, codex);
     assert.equal(loaded.defaultCwd, workspace);
     assert.deepEqual(loaded.allowedCwdRoots, [workspace]);
-    assert.deepEqual(loaded.codexIsolation.hidePaths, [
-      join(homedir(), '.ssh'),
-      workspace,
-    ]);
     assert.equal(loaded.seedSessions.oc_test.cwd, workspace);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -133,16 +121,12 @@ test('invalid configs are rejected with clear messages', () => {
     ['bad sandbox', { ...baseline, sandbox: 'bad' }, /sandbox/],
     ['bad reply mode', { ...baseline, replyMode: 'bad' }, /replyMode/],
     ['empty dm allowlist', { ...baseline, allowedDmUsers: [] }, /allowedDmUsers/],
-    ['empty chat allowlist', { ...baseline, allowedChats: [] }, /allowedChats/],
     ['empty cwd', { ...baseline, defaultCwd: '' }, /defaultCwd/],
     ['cwd outside roots', { ...baseline, defaultCwd: '/tmp/outside' }, /defaultCwd/],
     ['empty cwd roots', { ...baseline, allowedCwdRoots: [] }, /allowedCwdRoots/],
     ['filesystem root', { ...baseline, allowedCwdRoots: ['/'] }, /filesystem root/],
     ['bad model', { ...baseline, model: 123 }, /model/],
-    ['bad mention', { ...baseline, requireMention: 'false' }, /requireMention/],
-    ['bad concurrency', { ...baseline, maxConcurrentRuns: 0 }, /maxConcurrentRuns/],
-    ['bad timeout', { ...baseline, runTimeoutMs: 999 }, /runTimeoutMs/],
-    ['bad grace', { ...baseline, stopGraceMs: -1 }, /stopGraceMs/],
+    ['bad developer instructions', { ...baseline, developerInstructions: 1 }, /developerInstructions/],
     ['missing codex', { ...baseline, codexBin: '/nonexistent/codex' }, /codexBin/],
     [
       'missing codex command',

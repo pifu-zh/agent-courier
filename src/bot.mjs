@@ -5,17 +5,23 @@ import { createLarkChannel } from '@larksuite/channel';
 import { loadConfig, isCwdAllowed } from './config.mjs';
 import { logger } from './log.mjs';
 import { createSessionStore } from './sessions.mjs';
-import { runCodex } from './codex.mjs';
-import { scopeOf, isAllowed } from './policy.mjs';
-import { clipAnswer, renderForStream, appendProgress, STREAM_MAX, DELIVERY_MAX, DELIVERY_CHUNK } from './format.mjs';
-import { createRunQueue } from './run-queue.mjs';
+import { createCodexRunner } from './codex.mjs';
+import {
+  clipAnswer,
+  renderForStream,
+  appendProgress,
+  STREAM_MAX,
+  DELIVERY_MAX,
+  DELIVERY_CHUNK,
+} from './format.mjs';
 import { acquireLock } from './lock.mjs';
 import { BoundedCache } from './cache.mjs';
 
-const MAX_QUEUE_PER_SCOPE = 20;
+const SCOPE = 'main';
 const config = loadConfig();
 const lock = acquireLock(join(config.rootDir, 'bot.lock'), { logger });
 if (!lock) process.exit(1);
+
 const sessions = createSessionStore({
   file: config.sessionsFile,
   seedSessions: config.seedSessions,
@@ -23,15 +29,43 @@ const sessions = createSessionStore({
   logger,
 });
 
+function ensureMainSession() {
+  const current = sessions.getSession(SCOPE);
+  if (current) return current;
+  const existing = Object.values(sessions.allSessions())
+    .filter((entry) => entry?.threadId)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+  const seed = existing || Object.values(config.seedSessions)[0];
+  sessions.setSession(SCOPE, {
+    threadId: seed?.threadId || null,
+    cwd: seed?.cwd || config.defaultCwd,
+  });
+  return sessions.getSession(SCOPE);
+}
+
+ensureMainSession();
+const runner = createCodexRunner({
+  codexBin: config.codexBin,
+  logger,
+  developerInstructions: config.developerInstructions,
+});
+try {
+  const backend = await runner.start();
+  logger.info('appserver.started', backend);
+} catch (err) {
+  logger.error('appserver.start_failed', { message: err.message });
+  process.exit(1);
+}
+
 const HELP = [
-  '**Codex bot 命令**',
+  '**Codex 命令**',
   '- `/new` 或 `/reset`：开始新会话',
   '- `/stop`：停止当前任务',
-  '- `/status`：查看 thread / cwd / 队列状态',
+  '- `/status`：查看 thread / cwd / 当前任务',
   '- `/cd <绝对路径>`：切换工作目录并开始新会话',
   '- `/help`：显示本帮助',
   '',
-  '直接发消息即可让 Codex 执行任务。',
+  '直接发消息即可继续和 Codex 对话。',
 ].join('\n');
 
 for (const dir of new Set([
@@ -72,8 +106,8 @@ const channel = createLarkChannel({
   policy: {
     dmMode: 'allowlist',
     dmAllowlist: config.allowedDmUsers,
-    groupAllowlist: config.allowedChats,
-    requireMention: config.requireMention,
+    groupAllowlist: [],
+    requireMention: false,
     respondToMentionAll: false,
   },
   safety: {
@@ -109,23 +143,8 @@ const channel = createLarkChannel({
 });
 
 let shuttingDown = false;
-
-const queue = createRunQueue({
-  maxConcurrent: config.maxConcurrentRuns,
-  maxQueuePerScope: MAX_QUEUE_PER_SCOPE,
-  execute: executeRun,
-  logger,
-});
-
-const sessionEpochs = new Map();
-
-function currentEpoch(scope) {
-  return sessionEpochs.get(scope) || 0;
-}
-
-function bumpEpoch(scope) {
-  sessionEpochs.set(scope, currentEpoch(scope) + 1);
-}
+let active = null;
+let startingTurn = null;
 
 function sleep(ms) {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
@@ -149,14 +168,13 @@ async function sendChunk(msg, markdown) {
       if (!result?.messageId) throw new Error('reply returned no messageId');
       return result;
     } catch (err) {
-      const details = {
+      logger.warn('reply.chunk_failed', {
         attempt,
         message: err?.message || String(err),
         code: err?.code,
         status: err?.response?.status,
         feishuCode: err?.response?.data?.code,
-      };
-      logger.warn('reply.chunk_failed', details);
+      });
       if (attempt === 2 || !isRetryableSendError(err)) return null;
       await sleep(250 * (attempt + 1));
     }
@@ -164,7 +182,7 @@ async function sendChunk(msg, markdown) {
   return null;
 }
 
-async function safeReply(msg, markdown) {
+function safeReply(msg, markdown) {
   return sendChunk(msg, markdown);
 }
 
@@ -190,16 +208,7 @@ async function sendLong(msg, markdown) {
   }
 }
 
-async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
-  const session = sessions.getSession(scope) || {
-    threadId: null,
-    cwd: config.defaultCwd,
-  };
-  const cwd = session.cwd || config.defaultCwd;
-  if (!isCwdAllowed(config, cwd)) {
-    throw new Error(`cwd not allowed: ${cwd}`);
-  }
-
+function createDisplay(msg) {
   let latest = '';
   let progress = '';
   let lastTool = '';
@@ -207,9 +216,9 @@ async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
   let streamError = null;
   let updateTimer = null;
   const failuresBefore = streamUpdateFailures;
-  let resolveRun;
-  const runGate = new Promise((resolveGate) => {
-    resolveRun = resolveGate;
+  let resolveGate;
+  const gate = new Promise((resolveStreamGate) => {
+    resolveGate = resolveStreamGate;
   });
 
   const flush = async () => {
@@ -223,7 +232,6 @@ async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
     } catch (err) {
       streamError = err;
       logger.warn('stream.update_failed', {
-        scope,
         message: err.message,
         code: err?.code,
         status: err?.response?.status,
@@ -242,7 +250,7 @@ async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
 
   const streamPromise = (async () => {
     if (config.replyMode !== 'stream') {
-      await runGate;
+      await gate;
       return null;
     }
     try {
@@ -252,7 +260,7 @@ async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
           markdown: async (ctrl) => {
             controller = ctrl;
             await flush();
-            await runGate;
+            await gate;
             await flush();
           },
         },
@@ -261,178 +269,216 @@ async function runWithReply(scope, msg, text, signal, startedAt, epoch) {
     } catch (err) {
       streamError = err;
       logger.warn('stream.failed', {
-        scope,
         message: err.message,
         code: err?.code,
         status: err?.response?.status,
         feishuCode: err?.response?.data?.code,
       });
-      await runGate;
+      await gate;
       return null;
     }
   })();
 
+  return {
+    onAnswer(answer) {
+      latest = clipAnswer(answer);
+      schedule();
+    },
+    onTool(tool) {
+      const next = appendProgress(progress, tool?.command);
+      if (!next.summary || next.summary === lastTool) return;
+      lastTool = next.summary;
+      progress = next.progress;
+      schedule();
+    },
+    async finalize(result, { stale = false } = {}) {
+      const prefix = stale ? '（旧会话已失效，已自动开始新会话。）\n\n' : '';
+      const finalText =
+        prefix +
+        (result.ok
+          ? latest || '已完成，但没有返回文本。'
+          : result.cancelled
+            ? '已停止。'
+            : `执行失败：${result.error || '未知错误'}`);
+      latest = finalText;
+      progress = '';
+      resolveGate();
+      await flush();
+      await streamPromise.catch(() => null);
+
+      const updateFailed = streamUpdateFailures > failuresBefore;
+      const streamedOk =
+        config.replyMode === 'stream' && !streamError && !updateFailed;
+      const overflow = finalText.length > STREAM_MAX;
+      if (!streamedOk) {
+        await sendLong(msg, finalText);
+      } else if (overflow) {
+        await sendLong(msg, finalText.slice(STREAM_MAX));
+      }
+      return { streamed: streamedOk, overflow, updateFailed };
+    },
+  };
+}
+
+async function beginTurn(msg, text) {
+  const current = ensureMainSession();
+  const cwd = current.cwd || config.defaultCwd;
+  if (!isCwdAllowed(config, cwd)) {
+    throw new Error(`cwd not allowed: ${cwd}`);
+  }
+
+  let threadId = current.threadId || null;
+  let stale = false;
+  try {
+    const ensured = await runner.ensureThread({
+      threadId,
+      cwd,
+      sandbox: config.sandbox,
+      model: config.model,
+    });
+    threadId = ensured.threadId;
+    if (current.threadId !== threadId) {
+      sessions.setSession(SCOPE, { threadId, cwd });
+      logger.info('session.thread', { threadId });
+    }
+  } catch (err) {
+    if (threadId && /no rollout found/i.test(err.message)) {
+      stale = true;
+      logger.warn('session.resume_missing', { threadId });
+      sessions.clearThread(SCOPE);
+      const ensured = await runner.ensureThread({
+        threadId: null,
+        cwd,
+        sandbox: config.sandbox,
+        model: config.model,
+      });
+      threadId = ensured.threadId;
+      sessions.setSession(SCOPE, { threadId, cwd });
+      logger.info('session.thread', { threadId });
+    } else {
+      throw err;
+    }
+  }
+
+  const display = createDisplay(msg);
+  const startedAt = Date.now();
   logger.info('run.start', {
-    scope,
+    threadId,
     cwd,
-    resume: Boolean(session.threadId),
+    resume: Boolean(current.threadId) && !stale,
+    stale,
     sandbox: config.sandbox,
     model: config.model || 'default',
   });
 
-  const invoke = (threadId) =>
-    runCodex({
+  let turn;
+  try {
+    turn = await runner.startTurn({
+      threadId,
       prompt: text,
       cwd,
       sandbox: config.sandbox,
       model: config.model,
-      threadId,
-      codexBin: config.codexBin,
-      isolation: config.codexIsolation,
-      timeoutMs: config.runTimeoutMs,
-      stopGraceMs: config.stopGraceMs,
-      signal,
-      onThreadId: (threadId) => {
-        if (currentEpoch(scope) !== epoch) {
-          logger.info('session.thread_ignored', { scope, threadId });
-          return;
-        }
-        sessions.setSession(scope, { threadId, cwd });
-        logger.info('session.thread', { scope, threadId });
-      },
-      onAnswer: (answer) => {
-        latest = clipAnswer(answer);
-        schedule();
-      },
-      onTool: (tool) => {
-        const next = appendProgress(progress, tool?.command);
-        if (!next.summary || next.summary === lastTool) return;
-        lastTool = next.summary;
-        progress = next.progress;
-        schedule();
-      },
+      onAnswer: display.onAnswer,
+      onTool: display.onTool,
+    });
+  } catch (err) {
+    await display.finalize({ ok: false, error: err.message });
+    err.notified = true;
+    throw err;
+  }
+
+  const state = {
+    threadId,
+    turnId: turn.turnId,
+    startedAt,
+    display,
+    done: turn.done,
+  };
+  active = state;
+
+  turn.done
+    .then(async (result) => {
+      if (active === state) active = null;
+      const delivery = await display.finalize(result, { stale });
+      logger.info('run.end', {
+        threadId,
+        turnId: result.turnId || state.turnId,
+        ok: result.ok,
+        cancelled: Boolean(result.cancelled),
+        durationMs: Date.now() - startedAt,
+        answerLen: result.answer.length,
+        ...delivery,
+      });
+    })
+    .catch(async (err) => {
+      if (active === state) active = null;
+      logger.error('run.unhandled', { message: err.message });
+      await display.finalize({ ok: false, error: err.message });
     });
 
-  let result;
-  let staleThread = false;
-  try {
-    result = await invoke(session.threadId || undefined);
-    if (
-      !result.ok &&
-      !result.cancelled &&
-      session.threadId &&
-      /no rollout found/i.test(result.error || '')
-    ) {
-      staleThread = true;
-      logger.warn('session.resume_missing', {
-        scope,
-        threadId: session.threadId,
-      });
-      sessions.clearThread(scope);
-      latest = '';
-      progress = '';
-      lastTool = '';
-      schedule();
-      result = await invoke(undefined);
-    }
-  } catch (err) {
-    result = {
-      ok: false,
-      answer: latest,
-      threadId: session.threadId,
-      exitCode: -1,
-      error: err.message,
-    };
-  }
-
-  const prefix = staleThread ? '（旧会话已失效，已自动开始新会话。）\n\n' : '';
-  const finalText =
-    prefix +
-    (result.ok
-      ? latest || '已完成，但没有返回文本。'
-      : result.cancelled
-        ? '已停止。'
-        : `执行失败：${result.error || '未知错误'}`);
-
-  latest = finalText;
-  progress = '';
-  resolveRun();
-  await flush();
-  await streamPromise.catch(() => null);
-
-  const updateFailed = streamUpdateFailures > failuresBefore;
-  const streamedOk = config.replyMode === 'stream' && !streamError && !updateFailed;
-  const overflow = finalText.length > STREAM_MAX;
-  if (!streamedOk) {
-    await sendLong(msg, finalText);
-  } else if (overflow) {
-    await sendLong(msg, finalText.slice(STREAM_MAX));
-  }
-
-  logger.info('run.end', {
-    scope,
-    ok: result.ok,
-    exitCode: result.exitCode,
-    durationMs: Date.now() - startedAt,
-    answerLen: finalText.length,
-    streamed: streamedOk,
-    overflow,
-    streamUpdateFailed: updateFailed,
-  });
+  return state;
 }
 
-async function executeRun(scope, item, signal) {
-  const { msg, text } = item;
-  if (Date.now() - item.createdAt > config.queueTtlMs) {
-    logger.warn('run.expired', { scope, ageMs: Date.now() - item.createdAt });
-    await safeReply(msg, '任务已过期，请重新发送。');
-    return;
+async function settleActive({ interrupt = false } = {}) {
+  if (startingTurn) {
+    await startingTurn.catch(() => {});
   }
-  if (!isAllowed(config, msg)) {
-    logger.warn('run.not_allowed', { scope, senderId: msg.senderId });
-    await safeReply(msg, '权限已变更，任务未执行。');
-    return;
+  const state = active;
+  if (!state) return null;
+  if (interrupt) {
+    await runner.interrupt({
+      threadId: state.threadId,
+      turnId: state.turnId,
+    });
+    // Wait for turn/completed so the backend accepts the next turn on this thread.
+    await Promise.race([state.done.catch(() => {}), sleep(5000)]);
   }
-  const startedAt = Date.now();
-  const epoch = currentEpoch(scope);
-  let settled = false;
-  let removed = false;
-  const removeReactionOnce = (reactionId) => {
-    if (!reactionId || removed) return;
-    removed = true;
-    void channel.removeReaction(msg.messageId, reactionId).catch(() => {});
-  };
-  const reactionPromise = Promise.resolve()
-    .then(() => channel.addReaction(msg.messageId, 'Typing'))
-    .catch(() => undefined);
-  reactionPromise.then((reactionId) => {
-    if (settled) removeReactionOnce(reactionId);
-  });
+  if (active === state) active = null;
+  return state;
+}
 
+async function steerActive(msg, text) {
+  const state = active;
   try {
-    await runWithReply(scope, msg, text, signal, startedAt, epoch);
+    await runner.steer({
+      threadId: state.threadId,
+      turnId: state.turnId,
+      prompt: text,
+    });
+    logger.info('turn.steer', {
+      threadId: state.threadId,
+      turnId: state.turnId,
+      len: text.length,
+    });
+    return true;
   } catch (err) {
-    logger.error('run.unhandled', { scope, message: err.message });
-    await safeReply(msg, `执行失败：${err.message}`);
-  } finally {
-    settled = true;
-    let reactionId;
-    try {
-      reactionId = await Promise.race([
-        reactionPromise,
-        new Promise((resolveTimeout) => {
-          const timer = setTimeout(() => resolveTimeout(undefined), 2000);
-          timer.unref?.();
-        }),
-      ]);
-    } catch {
-      reactionId = undefined;
+    logger.warn('turn.steer_failed', {
+      message: err.message,
+      threadId: state.threadId,
+      turnId: state.turnId,
+    });
+    if (active === state) {
+      try {
+        await state.done;
+      } catch {
+        // the display already reports the turn failure
+      }
     }
-    removeReactionOnce(reactionId);
+    return false;
   }
 }
 
-async function handleCommand(msg, text, scope) {
+function isOwnerDm(msg) {
+  if (!msg || typeof msg !== 'object') return false;
+  if (msg.senderIsBot || msg.senderType === 'bot' || msg.senderType === 'app') {
+    return false;
+  }
+  if (msg.chatType !== 'p2p') return false;
+  return config.allowedDmUsers.includes(msg.senderId);
+}
+
+async function handleCommand(msg, text) {
   const command = text.split(/\s+/)[0].toLowerCase();
 
   if (
@@ -444,37 +490,47 @@ async function handleCommand(msg, text, scope) {
   }
 
   if (command === '/new' || command === '/reset') {
-    queue.abort(scope);
-    bumpEpoch(scope);
-    sessions.clearThread(scope);
+    await settleActive({ interrupt: true });
+    sessions.clearThread(SCOPE);
     await safeReply(msg, '已开始新会话。');
     return true;
   }
 
   if (command === '/stop') {
-    const stopped = queue.abort(scope);
-    if (!stopped) {
+    if (startingTurn) await startingTurn.catch(() => {});
+    if (!active) {
       await safeReply(msg, '当前没有运行中的任务。');
       return true;
     }
-    await safeReply(msg, '已发送停止信号。');
+    const state = active;
+    const stopped = await runner.interrupt({
+      threadId: state.threadId,
+      turnId: state.turnId,
+    });
+    await Promise.race([state.done.catch(() => {}), sleep(5000)]);
+    if (active === state) active = null;
+    await safeReply(
+      msg,
+      stopped ? '已发送停止信号。' : '停止失败，当前任务可能已经结束。',
+    );
     return true;
   }
 
   if (command === '/status') {
-    const session = sessions.getSession(scope) || {};
-    const state = queue.getState(scope);
+    const current = ensureMainSession();
+    const elapsed = active
+      ? Math.max(0, Math.round((Date.now() - active.startedAt) / 1000))
+      : 0;
     await safeReply(
       msg,
       [
         '**状态**',
-        `- thread: ${session.threadId ? `\`${session.threadId}\`` : '新会话'}`,
-        `- cwd: \`${session.cwd || config.defaultCwd}\``,
+        `- thread: ${current.threadId ? `\`${current.threadId}\`` : '新会话'}`,
+        `- cwd: \`${current.cwd || config.defaultCwd}\``,
         `- sandbox: \`${config.sandbox}\``,
         `- model: \`${config.model || 'default'}\``,
-        `- running: ${state.running ? '是' : '否'}`,
-        `- waiting: ${state.waiting ? '是' : '否'}`,
-        `- queued: ${state.queued}`,
+        `- app-server: ${runner.pid ? `\`pid ${runner.pid}\`` : '未运行'}`,
+        `- turn: ${active ? `\`${active.turnId}\`（${elapsed}s）` : '空闲'}`,
       ].join('\n'),
     );
     return true;
@@ -497,9 +553,8 @@ async function handleCommand(msg, text, scope) {
       await safeReply(msg, `目录不可用或不在允许范围内：\`${target}\``);
       return true;
     }
-    queue.abort(scope);
-    bumpEpoch(scope);
-    sessions.setSession(scope, { cwd: target, threadId: null });
+    await settleActive({ interrupt: true });
+    sessions.setSession(SCOPE, { cwd: target, threadId: null });
     await safeReply(msg, `已切换到 \`${target}\`，并开始新会话。`);
     return true;
   }
@@ -513,51 +568,49 @@ async function handleCommand(msg, text, scope) {
 }
 
 async function onMessage(msg) {
-  const scope = scopeOf(msg);
   try {
     if (shuttingDown) return;
-    if (!isAllowed(config, msg)) {
-      logger.warn('message.not_allowed', {
+    if (!isOwnerDm(msg)) {
+      logger.warn('message.ignored', {
         chatId: msg.chatId,
         senderId: msg.senderId,
         chatType: msg.chatType,
-        mentioned: msg.mentionedBot,
       });
       return;
     }
 
     const text = (msg.content || '').trim();
     logger.info('message.in', {
-      scope,
       chatType: msg.chatType,
       senderId: msg.senderId,
       len: text.length,
-      mentioned: msg.mentionedBot,
     });
 
-    if (await handleCommand(msg, text, scope)) return;
+    if (await handleCommand(msg, text)) return;
 
     if (!text) {
-      await safeReply(msg, `请发送具体任务。\n\n${HELP}`);
+      await safeReply(msg, `请发送具体内容。\n\n${HELP}`);
       return;
     }
 
-    const result = queue.enqueue(scope, { msg, text, createdAt: Date.now() });
-    if (!result.accepted) {
-      await safeReply(
-        msg,
-        result.reason === 'full'
-          ? '队列已满，请等当前任务结束后再发。'
-          : '机器人正在关闭，暂时不能执行任务。',
-      );
-      return;
+    if (startingTurn) {
+      await startingTurn.catch(() => {});
     }
-    if (result.queued && result.depth === 1) {
-      await safeReply(msg, '已排队，当前任务结束后会继续处理。');
+
+    if (active) {
+      const steered = await steerActive(msg, text);
+      if (steered) return;
+    }
+
+    startingTurn = beginTurn(msg, text);
+    try {
+      await startingTurn;
+    } finally {
+      startingTurn = null;
     }
   } catch (err) {
-    logger.error('message.handler_failed', { scope, message: err.message });
-    await safeReply(msg, `处理消息失败：${err.message}`);
+    logger.error('message.handler_failed', { message: err.message });
+    if (!err.notified) await safeReply(msg, `处理消息失败：${err.message}`);
   }
 }
 
@@ -586,21 +639,13 @@ async function shutdown(signal, exitCode = 0) {
   shuttingDown = true;
   logger.info('bot.shutdown', { signal, exitCode });
 
-  queue.shutdown();
-  const idle = await queue.waitForIdle(config.stopGraceMs + 1000);
-  if (!idle) {
-    logger.error('bot.shutdown_incomplete', {
-      signal,
-      stopGraceMs: config.stopGraceMs,
-    });
-  }
+  if (startingTurn) await startingTurn.catch(() => {});
+  await settleActive({ interrupt: true });
   await sessions.flush();
+  await runner.close();
 
   try {
-    await Promise.race([
-      channel.disconnect(),
-      sleep(5000),
-    ]);
+    await Promise.race([channel.disconnect(), sleep(5000)]);
   } catch (err) {
     logger.warn('channel.disconnect_failed', { message: err.message });
   }
@@ -634,10 +679,8 @@ logger.info('bot.starting', {
   sandbox: config.sandbox,
   replyMode: config.replyMode,
   cwd: config.defaultCwd,
-  maxConcurrentRuns: config.maxConcurrentRuns,
-  requireMention: config.requireMention,
+  mode: 'single-thread',
   allowedUsers: config.allowedDmUsers.length,
-  allowedChats: config.allowedChats.length,
 });
 
 try {
@@ -659,5 +702,6 @@ try {
   watchdog.unref?.();
 } catch (err) {
   logger.error('bot.connect_failed', { message: err.message, code: err.code });
+  lock.release();
   process.exit(1);
 }

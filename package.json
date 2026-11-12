@@ -1,7 +1,7 @@
 {
   "name": "agent-courier",
-  "version": "0.1.0",
-  "description": "Bridge Feishu messages to a local Codex CLI over the official Lark Channel SDK.",
+  "version": "0.2.0",
+  "description": "Bridge Feishu DMs to a persistent local Codex app-server session.",
   "private": true,
   "type": "module",
   "engines": {

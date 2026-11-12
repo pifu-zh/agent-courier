@@ -8,14 +8,12 @@ import {
   cleanupFixture,
   waitFor,
   waitForBotEvent,
-  waitForBotCount,
   readJsonl,
   botLog,
   botLogFile,
   updateConfig,
-  delay,
 } from '../helpers/harness.mjs';
-import { command, textMessage } from '../helpers/messages.mjs';
+import { dmCommand, dmMessage } from '../helpers/messages.mjs';
 import { join } from 'node:path';
 import { readFileSync, statSync } from 'node:fs';
 
@@ -25,16 +23,16 @@ async function start(fixture) {
   return handle;
 }
 
-test('/stop aborts the active codex process and reports stopped', async () => {
+test('/stop interrupts the active turn and reports stopped', async () => {
   const fixture = createFixture({
     name: 'lifecycle-stop',
     scenario: [
       {
         delayMs: 100,
         event: 'message',
-        msg: textMessage({ content: 'long task [[sleep=30000]]' }),
+        msg: dmMessage({ content: 'long task [[sleep=30000]]' }),
       },
-      { delayMs: 500, event: 'message', msg: command('/stop') },
+      { delayMs: 500, event: 'message', msg: dmCommand('/stop') },
     ],
   });
   let handle;
@@ -51,7 +49,8 @@ test('/stop aborts the active codex process and reports stopped', async () => {
     assert.ok(
       channel.some(
         (entry) =>
-          entry.type === 'reply' && entry.input?.markdown?.includes('已发送停止信号'),
+          entry.type === 'reply' &&
+          entry.input?.markdown?.includes('已发送停止信号'),
       ),
     );
     assert.ok(
@@ -62,16 +61,16 @@ test('/stop aborts the active codex process and reports stopped', async () => {
   }
 });
 
-test('/new aborts the active run and clears the thread', async () => {
+test('/new interrupts the active turn and clears the thread', async () => {
   const fixture = createFixture({
     name: 'lifecycle-new',
     scenario: [
       {
         delayMs: 100,
         event: 'message',
-        msg: textMessage({ content: 'long task [[sleep=30000]]' }),
+        msg: dmMessage({ content: 'long task [[sleep=30000]]' }),
       },
-      { delayMs: 500, event: 'message', msg: command('/new') },
+      { delayMs: 500, event: 'message', msg: dmCommand('/new') },
     ],
   });
   let handle;
@@ -86,7 +85,7 @@ test('/new aborts the active run and clears the thread', async () => {
     const sessions = JSON.parse(
       readFileSync(join(fixture.root, 'sessions.json'), 'utf8'),
     );
-    assert.equal(sessions.oc_test.threadId, null);
+    assert.equal(sessions.main.threadId, null);
     assert.ok(
       readJsonl(fixture.channelLog).some(
         (entry) =>
@@ -108,7 +107,7 @@ test('a missing rollout triggers one fresh thread and a notice', async () => {
       MOCK_CODEX_MODE: 'missing_thread',
       MOCK_CODEX_THREAD_ID: 'thread_new',
     },
-    scenario: [{ delayMs: 100, event: 'message', msg: textMessage() }],
+    scenario: [{ delayMs: 100, event: 'message', msg: dmMessage() }],
   });
   let handle;
   try {
@@ -134,7 +133,7 @@ test('a missing rollout triggers one fresh thread and a notice', async () => {
     const sessions = JSON.parse(
       readFileSync(join(fixture.root, 'sessions.json'), 'utf8'),
     );
-    assert.equal(sessions.oc_test.threadId, 'thread_new');
+    assert.equal(sessions.main.threadId, 'thread_new');
     assert.ok(
       botLog(fixture).some((entry) => entry.event === 'session.resume_missing'),
     );
@@ -143,14 +142,14 @@ test('a missing rollout triggers one fresh thread and a notice', async () => {
   }
 });
 
-test('SIGTERM during a run aborts codex and exits cleanly', async () => {
+test('SIGTERM during a run interrupts the turn and exits cleanly', async () => {
   const fixture = createFixture({
     name: 'lifecycle-shutdown',
     scenario: [
       {
         delayMs: 100,
         event: 'message',
-        msg: textMessage({ content: 'long task [[sleep=30000]]' }),
+        msg: dmMessage({ content: 'long task [[sleep=30000]]' }),
       },
     ],
   });
@@ -175,11 +174,7 @@ test('persists the new thread and never logs the prompt or app secret', async ()
     name: 'lifecycle-session',
     env: { MOCK_CODEX_THREAD_ID: 'thread_persist' },
     scenario: [
-      {
-        delayMs: 100,
-        event: 'message',
-        msg: textMessage({ content: 'SECRET_PROMPT_XYZ' }),
-      },
+      { delayMs: 100, event: 'message', msg: dmMessage({ content: 'SECRET_PROMPT_XYZ' }) },
     ],
   });
   let handle;
@@ -188,7 +183,7 @@ test('persists the new thread and never logs the prompt or app secret', async ()
     await waitForBotEvent(fixture, (entry) => entry.event === 'run.end');
     const file = join(fixture.root, 'sessions.json');
     const sessions = JSON.parse(readFileSync(file, 'utf8'));
-    assert.equal(sessions.oc_test.threadId, 'thread_persist');
+    assert.equal(sessions.main.threadId, 'thread_persist');
     assert.equal(statSync(file).mode & 0o777, 0o600);
     const raw = readFileSync(botLogFile(fixture), 'utf8');
     assert.equal(raw.includes('SECRET_PROMPT_XYZ'), false);
@@ -211,43 +206,5 @@ test('a second bot process is refused by the instance lock', async () => {
     assert.ok(botLog(fixture).some((entry) => entry.event === 'bot.lock_held'));
   } finally {
     cleanupFixture(fixture, first);
-  }
-});
-
-test('expires a queued task that waited too long', async () => {
-  const fixture = createFixture({
-    name: 'lifecycle-ttl',
-    configOverrides: { maxConcurrentRuns: 1, queueTtlMs: 100 },
-    scenario: [
-      {
-        delayMs: 100,
-        event: 'message',
-        msg: textMessage({ content: 'first [[sleep=500]]' }),
-      },
-      {
-        delayMs: 150,
-        event: 'message',
-        msg: textMessage({ content: 'second' }),
-      },
-    ],
-  });
-  let handle;
-  try {
-    handle = await start(fixture);
-    const reply = await waitFor(
-      fixture.channelLog,
-      (entry) =>
-        entry.type === 'reply' &&
-        entry.input?.markdown?.includes('任务已过期'),
-    );
-    assert.ok(reply);
-    await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 1);
-    await delay(150);
-    assert.equal(
-      readJsonl(fixture.codexLog).filter((entry) => entry.type === 'start').length,
-      1,
-    );
-  } finally {
-    cleanupFixture(fixture, handle);
   }
 });

@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {
   createFixture,
   spawnBot,
-  stopBot,
   cleanupFixture,
   waitFor,
   waitForCount,
@@ -11,7 +10,7 @@ import {
   readJsonl,
   updateConfig,
 } from '../helpers/harness.mjs';
-import { command } from '../helpers/messages.mjs';
+import { dmCommand } from '../helpers/messages.mjs';
 import { join } from 'node:path';
 import {
   readFileSync,
@@ -37,11 +36,11 @@ test('help, status, unknown and empty commands reply without codex', async () =>
   let handle;
   try {
     setScenario(fixture, [
-      { delayMs: 100, event: 'message', msg: command('/help') },
-      { delayMs: 150, event: 'message', msg: command('/status') },
-      { delayMs: 200, event: 'message', msg: command('/foo') },
-      { delayMs: 250, event: 'message', msg: command('') },
-      { delayMs: 300, event: 'message', msg: command('help') },
+      { delayMs: 100, event: 'message', msg: dmCommand('/help') },
+      { delayMs: 150, event: 'message', msg: dmCommand('/status') },
+      { delayMs: 200, event: 'message', msg: dmCommand('/foo') },
+      { delayMs: 250, event: 'message', msg: dmCommand('') },
+      { delayMs: 300, event: 'message', msg: dmCommand('help') },
     ]);
     handle = await start(fixture);
     const replies = await waitForCount(
@@ -50,10 +49,11 @@ test('help, status, unknown and empty commands reply without codex', async () =>
       5,
     );
     const text = replies.map((entry) => entry.input?.markdown || '').join('\n---\n');
-    assert.match(text, /Codex bot 命令/);
+    assert.match(text, /Codex 命令/);
     assert.match(text, /thread: 新会话/);
+    assert.match(text, /app-server/);
     assert.match(text, /未知命令/);
-    assert.match(text, /请发送具体任务/);
+    assert.match(text, /请发送具体内容/);
     assert.equal(readJsonl(fixture.codexLog).length, 0);
   } finally {
     cleanupFixture(fixture, handle);
@@ -66,9 +66,9 @@ test('/cd validates roots and persists a new cwd', async () => {
   try {
     const valid = join(fixture.work, 'sub');
     setScenario(fixture, [
-      { delayMs: 100, event: 'message', msg: command(`/cd ${valid}`) },
-      { delayMs: 180, event: 'message', msg: command('/cd /etc') },
-      { delayMs: 260, event: 'message', msg: command('/cd') },
+      { delayMs: 100, event: 'message', msg: dmCommand(`/cd ${valid}`) },
+      { delayMs: 180, event: 'message', msg: dmCommand('/cd /etc') },
+      { delayMs: 260, event: 'message', msg: dmCommand('/cd') },
     ]);
     handle = await start(fixture);
     const replies = await waitForCount(
@@ -81,8 +81,8 @@ test('/cd validates roots and persists a new cwd', async () => {
     assert.match(text, /不在允许范围/);
     assert.match(text, /用法/);
     const sessions = JSON.parse(readFileSync(join(fixture.root, 'sessions.json'), 'utf8'));
-    assert.equal(sessions.oc_test.cwd, valid);
-    assert.equal(sessions.oc_test.threadId, null);
+    assert.equal(sessions.main.cwd, valid);
+    assert.equal(sessions.main.threadId, null);
     assert.equal(
       statSync(join(fixture.root, 'sessions.json')).mode & 0o777,
       0o600,
@@ -103,8 +103,8 @@ test('/new clears the seeded thread and /status reflects it', async () => {
       },
     });
     setScenario(fixture, [
-      { delayMs: 100, event: 'message', msg: command('/new') },
-      { delayMs: 220, event: 'message', msg: command('/status') },
+      { delayMs: 100, event: 'message', msg: dmCommand('/new') },
+      { delayMs: 220, event: 'message', msg: dmCommand('/status') },
     ]);
     handle = await start(fixture);
     const replies = await waitForCount(
@@ -116,8 +116,8 @@ test('/new clears the seeded thread and /status reflects it', async () => {
     assert.match(text, /已开始新会话/);
     assert.match(text, /thread: 新会话/);
     const sessions = JSON.parse(readFileSync(join(fixture.root, 'sessions.json'), 'utf8'));
-    assert.equal(sessions.oc_test.threadId, null);
-    assert.equal(sessions.oc_test.cwd, fixture.work);
+    assert.equal(sessions.main.threadId, null);
+    assert.equal(sessions.main.cwd, fixture.work);
     assert.equal(readJsonl(fixture.codexLog).length, 0);
   } finally {
     cleanupFixture(fixture, handle);
@@ -131,7 +131,7 @@ test('/cd rejects a symlink that escapes the allowed roots', async () => {
     const escape = join(fixture.work, 'escape');
     symlinkSync('/etc', escape);
     setScenario(fixture, [
-      { delayMs: 100, event: 'message', msg: command(`/cd ${escape}`) },
+      { delayMs: 100, event: 'message', msg: dmCommand(`/cd ${escape}`) },
     ]);
     handle = await start(fixture);
     const reply = await waitFor(
@@ -148,7 +148,9 @@ test('/cd rejects a symlink that escapes the allowed roots', async () => {
 test('a normal prompt starting with "help" is not hijacked', async () => {
   const fixture = createFixture({
     name: 'commands-help-prompt',
-    scenario: [{ delayMs: 100, event: 'message', msg: command('help me fix this') }],
+    scenario: [
+      { delayMs: 100, event: 'message', msg: dmCommand('help me fix this') },
+    ],
   });
   let handle;
   try {
@@ -166,7 +168,7 @@ test('a normal prompt starting with "help" is not hijacked', async () => {
 test('/stop with no active run is a no-op reply', async () => {
   const fixture = createFixture({
     name: 'commands-stop-idle',
-    scenario: [{ delayMs: 100, event: 'message', msg: command('/stop') }],
+    scenario: [{ delayMs: 100, event: 'message', msg: dmCommand('/stop') }],
   });
   let handle;
   try {

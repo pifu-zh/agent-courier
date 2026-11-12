@@ -10,29 +10,14 @@ import {
   botLog,
   readJsonl,
 } from '../helpers/harness.mjs';
+import { dmMessage } from '../helpers/messages.mjs';
 
-function message(overrides = {}) {
-  return {
-    messageId: 'om_1',
-    chatId: 'oc_test',
-    chatType: 'group',
-    senderId: 'ou_test',
-    senderIsBot: false,
-    content: 'hello',
-    mentionedBot: true,
-    mentions: [],
-    mentionAll: false,
-    createTime: Date.now(),
-    rawContentType: 'text',
-    resources: [],
-    ...overrides,
-  };
-}
-
-test('smoke: one group message runs codex and streams a reply', async () => {
+test('smoke: one owner DM runs codex and streams a reply', async () => {
   const fixture = createFixture({
     name: 'smoke',
-    scenario: [{ delayMs: 100, event: 'message', msg: message() }],
+    scenario: [
+      { delayMs: 100, event: 'message', msg: dmMessage({ content: 'hello' }) },
+    ],
   });
   let handle;
   try {
@@ -43,8 +28,6 @@ test('smoke: one group message runs codex and streams a reply', async () => {
     const stream = channel.filter((entry) => entry.type === 'stream.content');
     assert.ok(stream.length >= 1);
     assert.ok(stream.some((entry) => entry.content.includes('MOCK_OK')));
-    assert.ok(channel.some((entry) => entry.type === 'reaction.add'));
-    assert.ok(channel.some((entry) => entry.type === 'reaction.remove'));
     const ends = botLog(fixture).filter((entry) => entry.event === 'run.end');
     assert.equal(ends.length, 1);
     assert.equal(ends[0].ok, true);

@@ -35,3 +35,7 @@ export function dmMessage(overrides = {}) {
 export function command(content, overrides = {}) {
   return textMessage({ content, ...overrides });
 }
+
+export function dmCommand(content, overrides = {}) {
+  return dmMessage({ content, ...overrides });
+}

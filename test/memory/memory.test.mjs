@@ -13,7 +13,7 @@ import {
   triggerReport,
   delay,
 } from '../helpers/harness.mjs';
-import { textMessage } from '../helpers/messages.mjs';
+import { dmMessage } from '../helpers/messages.mjs';
 
 async function start(fixture) {
   const handle = spawnBot(fixture);
@@ -47,7 +47,7 @@ async function sampleBot(handle, fixture) {
 
 function assertNoRuntimeErrors(fixture) {
   const bad = botLog(fixture).filter((entry) =>
-    ['run.unhandled', 'queue.execute_failed', 'uncaught_exception'].includes(
+    ['run.unhandled', 'uncaught_exception'].includes(
       entry.event,
     ),
   );
@@ -83,23 +83,23 @@ test('repeated large runs return to a bounded baseline', async () => {
   const scenario = [];
   for (let i = 0; i < 20; i += 1) {
     scenario.push({
-      delayMs: 100 + i * 100,
+      delayMs: 100 + i * 1000,
       event: 'message',
-      msg: textMessage({ content: `batch-a ${i} [[sleep=20]]` }),
+      msg: dmMessage({ content: `batch-a ${i} [[sleep=20]]` }),
     });
   }
   for (let i = 0; i < 20; i += 1) {
     scenario.push({
-      delayMs: 4000 + i * 100,
+      delayMs: 21000 + i * 1000,
       event: 'message',
-      msg: textMessage({ content: `batch-b ${i} [[sleep=20]]` }),
+      msg: dmMessage({ content: `batch-b ${i} [[sleep=20]]` }),
     });
   }
   for (let i = 0; i < 20; i += 1) {
     scenario.push({
-      delayMs: 8000 + i * 100,
+      delayMs: 41000 + i * 1000,
       event: 'message',
-      msg: textMessage({ content: `batch-c ${i} [[sleep=20]]` }),
+      msg: dmMessage({ content: `batch-c ${i} [[sleep=20]]` }),
     });
   }
   const fixture = createFixture({
@@ -116,17 +116,17 @@ test('repeated large runs return to a bounded baseline', async () => {
   try {
     handle = await start(fixture);
     await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 20, {
-      timeout: 20000,
+      timeout: 35000,
     });
     await delay(500);
     const first = await sampleBot(handle, fixture);
     await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 40, {
-      timeout: 30000,
+      timeout: 55000,
     });
     await delay(500);
     const second = await sampleBot(handle, fixture);
     await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 60, {
-      timeout: 40000,
+      timeout: 75000,
     });
     await delay(500);
     const third = await sampleBot(handle, fixture);
