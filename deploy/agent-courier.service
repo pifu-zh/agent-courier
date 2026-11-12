@@ -1,0 +1,20 @@
+[Unit]
+Description=agent-courier (Feishu to Codex)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/agent-courier
+EnvironmentFile=%h/.local/share/agent-courier/.env
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=/usr/bin/node --max-old-space-size=256 %h/.local/share/agent-courier/src/bot.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

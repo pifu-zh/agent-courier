@@ -1,0 +1,12 @@
+node_modules/
+.env
+config.json
+sessions.json
+bot.lock
+logs/
+*.log
+report.*.json
+.DS_Store
+
+workspace/*
+!workspace/.gitkeep

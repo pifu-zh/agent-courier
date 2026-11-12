@@ -1,0 +1,23 @@
+{
+  "name": "agent-courier",
+  "version": "0.1.0",
+  "description": "Bridge Feishu messages to a local Codex CLI over the official Lark Channel SDK.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/bot.mjs",
+    "test": "node --test --test-concurrency=1 test/unit/*.test.mjs test/integration/*.test.mjs test/memory/*.test.mjs",
+    "test:unit": "node --test --test-concurrency=1 test/unit/*.test.mjs",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.mjs",
+    "test:memory": "node --test --test-concurrency=1 test/memory/*.test.mjs"
+  },
+  "dependencies": {
+    "@larksuite/channel": "0.6.1"
+  },
+  "overrides": {
+    "@larksuiteoapi/node-sdk": "1.76.0"
+  }
+}
