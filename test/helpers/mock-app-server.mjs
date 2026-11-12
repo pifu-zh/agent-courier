@@ -219,7 +219,7 @@ async function runTurn({ threadId, turnId, prompt }) {
 }
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-rl.on('line', (line) => {
+rl.on('line', async (line) => {
   let message;
   try {
     message = JSON.parse(line);
@@ -296,6 +296,8 @@ rl.on('line', (line) => {
   }
 
   if (method === 'turn/start') {
+    const startDelayMs = Number(process.env.MOCK_CODEX_TURN_START_DELAY_MS || 0);
+    if (startDelayMs > 0) await sleep(startDelayMs);
     const threadId = params.threadId;
     const resume = resumedThreads.has(threadId);
     turnSequence += 1;

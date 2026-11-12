@@ -11,10 +11,10 @@ import {
   readJsonl,
   botLog,
 } from '../helpers/harness.mjs';
-import { dmMessage, textMessage } from '../helpers/messages.mjs';
+import { dmMessage, dmCommand, textMessage } from '../helpers/messages.mjs';
 
-async function start(fixture) {
-  const handle = spawnBot(fixture);
+async function start(fixture, options) {
+  const handle = spawnBot(fixture, options);
   await waitFor(fixture.channelLog, (entry) => entry.type === 'connected');
   return handle;
 }
@@ -82,6 +82,52 @@ test('two idle messages reuse one app-server and one thread', async () => {
     assert.equal(
       botLog(fixture).filter((entry) => entry.event === 'appserver.started').length,
       1,
+    );
+    await stopBot(handle);
+  } finally {
+    cleanupFixture(fixture, handle);
+  }
+});
+
+test('/new during an in-flight turn start abandons that turn', async () => {
+  const fixture = createFixture({
+    name: 'conversation-new-race',
+    scenario: [
+      {
+        delayMs: 100,
+        event: 'message',
+        msg: dmMessage({ content: 'first [[sleep=3000]]' }),
+      },
+      { delayMs: 220, event: 'message', msg: dmCommand('/new') },
+      { delayMs: 1000, event: 'message', msg: dmMessage({ content: 'after' }) },
+    ],
+  });
+  let handle;
+  try {
+    handle = await start(fixture, {
+      env: { MOCK_CODEX_TURN_START_DELAY_MS: '400' },
+    });
+    await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 2, {
+      timeout: 10000,
+    });
+
+    const events = readJsonl(fixture.codexLog);
+    assert.equal(events.filter((entry) => entry.type === 'steer').length, 0);
+    const starts = events.filter((entry) => entry.type === 'start');
+    assert.equal(starts.length, 2);
+    assert.notEqual(starts[0].threadId, starts[1].threadId);
+    const ends = events.filter((entry) => entry.type === 'end');
+    assert.equal(ends[0].status, 'interrupted');
+    assert.equal(ends[1].status, 'completed');
+
+    const threadIds = botLog(fixture)
+      .filter((entry) => entry.event === 'session.thread')
+      .map((entry) => entry.threadId);
+    assert.equal(threadIds.length, 2);
+    assert.notEqual(threadIds[0], threadIds[1]);
+    assert.equal(
+      readJsonl(fixture.channelLog).filter((entry) => entry.type === 'reply').length > 0,
+      true,
     );
     await stopBot(handle);
   } finally {
