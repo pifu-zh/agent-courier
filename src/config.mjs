@@ -36,7 +36,7 @@ function resolveExecutable(value, rootDir, env) {
     const candidate = join(dir, expanded);
     if (existsSync(candidate)) return candidate;
   }
-  return expanded;
+  return null;
 }
 
 export function loadDotEnv(file, env = process.env) {
@@ -158,9 +158,10 @@ export function loadConfig({
     'codexBin must be a non-empty string',
   );
   const codexBin = resolveExecutable(raw.codexBin, rootDir, env);
+  assert(codexBin, `codexBin is not on PATH: ${raw.codexBin}`);
   assert(
     existsSync(codexBin),
-    `codexBin is missing or not on PATH: ${raw.codexBin}`,
+    `codexBin is missing: ${raw.codexBin}`,
   );
   assert(
     (statSync(codexBin).mode & 0o111) !== 0,
