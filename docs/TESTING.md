@@ -38,7 +38,7 @@ node --test --test-concurrency=1 --test-name-pattern="steer" test/integration/co
 | 会话 | 第一条消息创建 thread、后续 turn 复用同一 thread、插件重启后 resume |
 | 忙时 | 当前 turn 活跃时新消息通过 `turn/steer` 注入；不新建 turn |
 | 命令 | `/help`、`/status`、`/new`、`/reset`、`/stop`（空闲/运行中）、`/cd`（合法/越界/symlink 逃逸）、未知命令、空消息 |
-| 生命周期 | `/stop` 中断、`/new` 中断并清 thread、SIGTERM 关停、单实例锁 |
+| 生命周期 | `/stop` 中断、`/new` 中断并回收 app-server/清 thread、SIGTERM 关停、单实例锁 |
 | app-server | 初始化、thread/start、thread/resume、turn/start、turn/steer、turn/interrupt、turn.failed、缺失 rollout、异常退出、未知事件 |
 | 流式回复 | 流创建失败回退、`setContent` 失败回退、26k 卡片上限、剩余内容分片发送 |
 | 持久化 | seed、原子写、600 权限、损坏 JSON、thread 清空、cwd 更新、maxEntries/TTL 剪枝 |

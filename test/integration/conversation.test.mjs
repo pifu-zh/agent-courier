@@ -135,6 +135,40 @@ test('/new during an in-flight turn start abandons that turn', async () => {
   }
 });
 
+test('/new recycles the app-server and starts a fresh thread', async () => {
+  const fixture = createFixture({
+    name: 'conversation-new-recycle',
+    scenario: [
+      { delayMs: 100, event: 'message', msg: dmMessage({ content: 'one' }) },
+      { delayMs: 800, event: 'message', msg: dmCommand('/new') },
+      { delayMs: 1300, event: 'message', msg: dmMessage({ content: 'two' }) },
+    ],
+  });
+  let handle;
+  try {
+    handle = await start(fixture);
+    await waitForBotCount(fixture, (entry) => entry.event === 'run.end', 2, {
+      timeout: 10000,
+    });
+
+    const starts = readJsonl(fixture.codexLog).filter(
+      (entry) => entry.type === 'start',
+    );
+    assert.equal(starts.length, 2);
+    assert.notEqual(starts[0].threadId, starts[1].threadId);
+
+    const started = botLog(fixture).filter(
+      (entry) => entry.event === 'appserver.ready',
+    );
+    assert.equal(started.length, 2);
+    assert.notEqual(started[0].pid, started[1].pid);
+    assert.ok(botLog(fixture).some((entry) => entry.event === 'appserver.recycled'));
+    await stopBot(handle);
+  } finally {
+    cleanupFixture(fixture, handle);
+  }
+});
+
 test('group messages are ignored', async () => {
   const fixture = createFixture({
     name: 'conversation-group-ignore',

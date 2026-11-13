@@ -19,7 +19,7 @@
 - 当前 turn 还在执行时，新消息用 `turn/steer` 注入同一个 turn
 - 没有消息队列、没有按 chat 的并发控制
 - 不设总超时；长任务由 Codex 放进后台 tmux，不阻塞会话
-- `/stop` 中断当前 turn，`/new` 开新 thread
+- `/stop` 中断当前 turn，`/new` 开新 thread 并回收 app-server，释放旧 thread 的常驻内存
 - thread id 持久化到 `sessions.json`，插件重启后通过 `thread/resume` 继续
 
 ## 要求
@@ -109,7 +109,7 @@ journalctl --user -u agent-courier.service -f
 | 命令 | 作用 |
 |---|---|
 | `/help` | 显示帮助 |
-| `/new`、`/reset` | 中断当前 turn，开始新 thread |
+| `/new`、`/reset` | 中断当前 turn，回收 app-server，开始新 thread |
 | `/stop` | 中断当前 turn |
 | `/status` | 显示 thread、cwd、app-server、当前 turn |
 | `/cd <路径>` | 切换 cwd 并开始新 thread；支持 `~` |
@@ -145,6 +145,7 @@ journalctl --user -u agent-courier.service -f
 - bot 只保留当前 turn 的答案和最近进度
 - 单条工具输出截断 4 KB，最终答案截断 100 KB
 - app-server 的 thread 和历史由 Codex 自己管理
+- `/new`、`/cd` 会回收 app-server，避免多个旧 thread 常驻内存
 - 服务以 `--max-old-space-size=256` 启动：bot 进程异常增长会先 OOM 重启
 - 不设置 cgroup `MemoryMax`：Codex 子进程在同一 cgroup，硬上限会误杀长任务
 

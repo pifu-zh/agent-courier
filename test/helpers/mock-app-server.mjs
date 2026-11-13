@@ -37,7 +37,7 @@ function sleep(ms) {
 
 function newThreadId() {
   threadSequence += 1;
-  if (!fixedThreadId) return `mock-thread-${threadSequence}`;
+  if (!fixedThreadId) return `mock-${process.pid}-thread-${threadSequence}`;
   return threadSequence === 1 ? fixedThreadId : `${fixedThreadId}-${threadSequence}`;
 }
 
@@ -301,7 +301,7 @@ rl.on('line', async (line) => {
     const threadId = params.threadId;
     const resume = resumedThreads.has(threadId);
     turnSequence += 1;
-    const turnId = `mock-turn-${turnSequence}`;
+    const turnId = `mock-${process.pid}-turn-${turnSequence}`;
     const prompt = params.input?.find((input) => input.type === 'text')?.text || '';
     const startedAtMs = Date.now();
     const state = {

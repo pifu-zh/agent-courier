@@ -326,6 +326,19 @@ export function createCodexRunner({
     return ctx ? { threadId: ctx.threadId, turnId: ctx.turnId } : null;
   }
 
+  async function recycle(reason = 'manual') {
+    for (const ctx of [...activeByThread.values()]) {
+      finish(ctx, { ok: false, error: 'app-server recycled' });
+    }
+    const client = server;
+    server = null;
+    loadedThreads.clear();
+    if (!client) return false;
+    logger.info?.('appserver.recycled', { reason, pid: client.pid });
+    await client.stop().catch(() => {});
+    return true;
+  }
+
   async function close() {
     for (const ctx of [...activeByThread.values()]) {
       finish(ctx, { ok: false, error: 'app-server is shutting down' });
@@ -342,10 +355,14 @@ export function createCodexRunner({
     startTurn,
     steer,
     interrupt,
+    recycle,
     activeTurn,
     close,
     get pid() {
       return server?.pid ?? 0;
+    },
+    get threadCount() {
+      return loadedThreads.size;
     },
   };
 }

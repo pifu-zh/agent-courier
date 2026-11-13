@@ -491,6 +491,7 @@ async function handleCommand(msg, text) {
 
   if (command === '/new' || command === '/reset') {
     await settleActive({ interrupt: true });
+    if (runner.threadCount > 0) await runner.recycle('new-session');
     sessions.clearThread(SCOPE);
     await safeReply(msg, '已开始新会话。');
     return true;
@@ -529,7 +530,7 @@ async function handleCommand(msg, text) {
         `- cwd: \`${current.cwd || config.defaultCwd}\``,
         `- sandbox: \`${config.sandbox}\``,
         `- model: \`${config.model || 'default'}\``,
-        `- app-server: ${runner.pid ? `\`pid ${runner.pid}\`` : '未运行'}`,
+        `- app-server: ${runner.pid ? `\`pid ${runner.pid}\`（threads: ${runner.threadCount}）` : '未运行'}`,
         `- turn: ${active ? `\`${active.turnId}\`（${elapsed}s）` : '空闲'}`,
       ].join('\n'),
     );
@@ -554,6 +555,7 @@ async function handleCommand(msg, text) {
       return true;
     }
     await settleActive({ interrupt: true });
+    if (runner.threadCount > 0) await runner.recycle('cwd-change');
     sessions.setSession(SCOPE, { cwd: target, threadId: null });
     await safeReply(msg, `已切换到 \`${target}\`，并开始新会话。`);
     return true;

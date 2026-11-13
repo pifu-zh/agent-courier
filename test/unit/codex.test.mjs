@@ -121,6 +121,28 @@ test('reuses one app-server and one thread across turns', async () => {
   }
 });
 
+test('recycle stops the app-server and clears loaded threads', async () => {
+  const { dir, runner } = setup({ MOCK_CODEX_THREAD_ID: 'thread_recycle' });
+  try {
+    const first = await runner.start();
+    await runner.ensureThread({ cwd: dir, sandbox: 'read-only' });
+    assert.equal(runner.threadCount, 1);
+    assert.equal(await runner.recycle('test'), true);
+    assert.equal(runner.pid, 0);
+    assert.equal(runner.threadCount, 0);
+    assert.equal(await runner.recycle('again'), false);
+
+    const second = await runner.start();
+    assert.ok(second.pid > 0);
+    assert.notEqual(second.pid, first.pid);
+    const thread = await runner.ensureThread({ cwd: dir, sandbox: 'read-only' });
+    assert.equal(thread.threadId, 'thread_recycle');
+    assert.equal(runner.threadCount, 1);
+  } finally {
+    await close(runner, dir);
+  }
+});
+
 test('steers a message into an active turn', async () => {
   const { dir, log, runner } = setup();
   try {
